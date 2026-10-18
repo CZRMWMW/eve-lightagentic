@@ -1,0 +1,4632 @@
+import os
+import re
+import json
+import time
+import hashlib
+from dataclasses import dataclass, field
+import numpy as np
+import configparser
+import asyncio
+
+from typing import Any, ClassVar, Sequence, Union, final
+
+from ..base import (
+    CURSOR_END,
+    CURSOR_START,
+    BaseGraphStorage,
+    BaseKVStorage,
+    BaseVectorStorage,
+    CursorAfter,
+    CursorPosition,
+    DocProcessingStatus,
+    DocSchedulingRecord,
+    DocStatus,
+    DocStatusPage,
+    DocStatusStorage,
+    SourceAbsent,
+    SourceConflict,
+    SourceConflictPage,
+    SourceConflictRepairResult,
+    SourceConflictSummary,
+    SourceResolution,
+    SourceUnique,
+)
+from ..utils import (
+    logger,
+    compute_mdhash_id,
+    _cooperative_yield,
+    merge_source_ids,
+    validate_interpreted_attribute_names,
+    validate_workspace,
+)
+from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
+from ..constants import (
+    CUSTOM_CHUNK_PATCH_METADATA_KEY,
+    GRAPH_FIELD_SEP,
+    DEFAULT_QUERY_PRIORITY,
+)
+from ..exceptions import (
+    SourceConflictRepairCASError,
+    StorageControlPlaneError,
+    StorageRecordNotFoundError,
+)
+from .._version import __version__
+from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
+
+import pipmaster as pm
+
+if not pm.is_installed("pymongo"):
+    pm.install("pymongo")
+
+from pymongo import AsyncMongoClient  # type: ignore
+from pymongo import UpdateOne  # type: ignore
+from pymongo.asynchronous.database import AsyncDatabase  # type: ignore
+from pymongo.asynchronous.collection import AsyncCollection  # type: ignore
+from pymongo.operations import SearchIndexModel  # type: ignore
+from pymongo.driver_info import DriverInfo  # type: ignore
+from pymongo.errors import (  # type: ignore
+    PyMongoError,
+    DuplicateKeyError,
+    BulkWriteError,
+)
+
+config = configparser.ConfigParser()
+config.read("config.ini", "utf-8")
+
+GRAPH_BFS_MODE = os.getenv("MONGO_GRAPH_BFS_MODE", "bidirectional")
+
+# Flush-time batching limits shared by every MongoDB upsert path
+# (MongoVectorDBStorage, MongoKVStorage, MongoGraphStorage).
+# The payload-byte budget is the primary limiter; the record-count caps are a
+# secondary guard that only binds when individual records are small.
+# Upsert and delete have separate count caps on purpose: upsert records each
+# carry a full embedding vector and are far heavier than delete _ids, so the
+# upsert batch count is kept much smaller than the delete one.
+# MongoDB caps a single BSON document at 16MB and a single bulk command message
+# at 48MB; a 16MB JSON estimate (which overestimates the real BSON size) keeps
+# every bulk_write comfortably below the wire limit and bounds peak memory.
+DEFAULT_MONGO_UPSERT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024  # 16MB
+DEFAULT_MONGO_UPSERT_MAX_RECORDS_PER_BATCH = 128
+DEFAULT_MONGO_DELETE_MAX_RECORDS_PER_BATCH = 1000
+
+# MongoDB duplicate-key error code, raised when an upsert insert races the
+# unique edge-endpoint index (another writer inserted the same edge first).
+_DUPLICATE_KEY_CODE = 11000
+
+# Emit a migration progress line every this many deduped docs, so operators
+# watching a large migration see liveness (mirrors the OpenSearch canonical-id
+# migration's progress cadence).
+_EDGE_MIGRATION_PROGRESS_INTERVAL = 50_000
+
+# Ceiling on how many same-depth candidates get a degree lookup before the
+# max_nodes cap in the bidirectional BFS. node_degrees_batch binds the whole
+# list into two `$in` arrays, and one hub can put 100k neighbours in a single
+# level -- an array that size inflates the command document and forces the
+# planner through a huge index-bounds list for a ranking that only decides the
+# order of candidates max_nodes will mostly discard anyway. (Deliberately not
+# shared with the OpenSearch constant of the same value: that one is derived
+# from index.max_terms_count / search.max_buckets, this one from $in size.)
+_GRAPH_DEGREE_RANK_MAX_CANDIDATES = 8192
+
+
+def _canonical_edge_endpoints(
+    source_node_id: str, target_node_id: str
+) -> tuple[str, str]:
+    """Direction-independent ``(edge_lo, edge_hi)`` endpoints for an undirected edge.
+
+    The sorted pair maps ``(A,B)`` and ``(B,A)`` to the same two field values,
+    so a *compound* unique index on ``(edge_lo, edge_hi)`` lets MongoDB reject
+    the second of two racing inserts (the classic ``$or``-upsert duplicate gap)
+    regardless of direction. Storing the endpoints as two separate fields — not
+    a single delimiter-joined string — avoids any collision between distinct
+    pairs whose ids happen to contain the delimiter (e.g. custom-KG ids), and
+    needs no input sanitisation. Reads keep using the bidirectional ``$or``.
+    """
+    return tuple(sorted((source_node_id, target_node_id)))  # type: ignore[return-value]
+
+
+def _edge_source_id_list(doc: dict[str, Any]) -> list[str]:
+    """Return an edge doc's source ids, from the ``source_ids`` array or by
+    splitting the ``GRAPH_FIELD_SEP``-joined ``source_id`` string."""
+    sids = doc.get("source_ids")
+    if not sids and doc.get("source_id"):
+        sids = doc["source_id"].split(GRAPH_FIELD_SEP)
+    return list(sids or [])
+
+
+def _coerce_weight(weight: Any) -> float | None:
+    """Coerce a (possibly string) edge weight to float, or None if non-numeric."""
+    if weight is None:
+        return None
+    try:
+        return float(weight)
+    except (TypeError, ValueError):
+        return None
+
+
+def _estimate_doc_bytes(doc: Any) -> int:
+    """Estimate a document's serialized byte size via compact JSON.
+
+    JSON overestimates the real BSON size MongoDB writes (a JSON float string is
+    far longer than the 8 bytes a BSON double encodes), so callers stay
+    conservatively below server limits and never underestimate.
+
+    This is a splitting *heuristic*, not the exact wire size: upsert callers pass
+    only the dominant payload field (the ``$set`` body / ``update_doc``), not the
+    full ``UpdateOne`` op (filter, ``$setOnInsert``, ``$or`` wrapper). Those extras
+    are tiny next to an embedding/document body, and the 16MB estimate budget sits
+    far under MongoDB's 48MB bulk-command limit, so the under-count is immaterial;
+    the server stays the final arbiter.
+    """
+    return len(
+        json.dumps(doc, ensure_ascii=False, separators=(",", ":"), default=str).encode(
+            "utf-8"
+        )
+    )
+
+
+def _chunk_by_budget(
+    items: list[Any],
+    size_of,
+    max_payload_bytes: int,
+    max_records_per_batch: int,
+) -> list[tuple[list[Any], int]]:
+    """Split items into batches by estimated payload size (primary) and count.
+
+    The byte budget is the primary limiter: items accumulate until adding the
+    next one would exceed ``max_payload_bytes``, then a new batch starts.
+    ``size_of(item)`` returns an item's estimated serialized byte size. A single
+    item larger than the byte budget is emitted as its own batch rather than
+    raising; the server stays the final arbiter. A non-positive limit disables
+    that dimension. Returns ``(batch, summed_estimated_bytes)`` tuples (the
+    estimate is used for logging).
+    """
+    if not items:
+        return []
+
+    payload_limit = max_payload_bytes if max_payload_bytes > 0 else float("inf")
+    records_limit = max_records_per_batch if max_records_per_batch > 0 else float("inf")
+
+    batches: list[tuple[list[Any], int]] = []
+    current: list[Any] = []
+    # JSON array overhead ("[]")
+    current_bytes = 2
+
+    for item in items:
+        item_bytes = size_of(item)
+        # If current batch not empty, a comma is needed before next element.
+        separator_overhead = 1 if current else 0
+        next_bytes = current_bytes + separator_overhead + item_bytes
+
+        if current and (len(current) >= records_limit or next_bytes > payload_limit):
+            batches.append((current, current_bytes))
+            current = []
+            current_bytes = 2
+            next_bytes = current_bytes + item_bytes
+
+        current.append(item)
+        current_bytes = next_bytes
+
+    if current:
+        batches.append((current, current_bytes))
+
+    return batches
+
+
+def _resolve_upsert_batch_limits() -> tuple[int, int]:
+    """Resolve flush-time upsert batching limits from env, with module defaults.
+
+    Shared by every MongoDB upsert path so the byte/record caps that bound a
+    single ``bulk_write`` are consistent across all of them. A non-positive
+    value disables that splitting dimension.
+    """
+    max_payload_bytes = int(
+        os.getenv(
+            "MONGO_UPSERT_MAX_PAYLOAD_BYTES",
+            str(DEFAULT_MONGO_UPSERT_MAX_PAYLOAD_BYTES),
+        )
+    )
+    max_records_per_batch = int(
+        os.getenv(
+            "MONGO_UPSERT_MAX_RECORDS_PER_BATCH",
+            str(DEFAULT_MONGO_UPSERT_MAX_RECORDS_PER_BATCH),
+        )
+    )
+    if max_payload_bytes <= 0:
+        logger.warning(
+            f"MONGO_UPSERT_MAX_PAYLOAD_BYTES={max_payload_bytes} is non-positive, disable payload-size splitting"
+        )
+    if max_records_per_batch <= 0:
+        logger.warning(
+            f"MONGO_UPSERT_MAX_RECORDS_PER_BATCH={max_records_per_batch} is non-positive, disable upsert record-count splitting"
+        )
+    return max_payload_bytes, max_records_per_batch
+
+
+def _resolve_delete_batch_limit() -> int:
+    """Resolve the flush-time delete record-count cap from env, with module default.
+
+    Shared by every MongoDB delete path that fans a list of match clauses into a
+    single server message (``delete_many`` with ``$in``/``$or``), so the cap that
+    keeps one delete under the bulk message / 16MB query limit is consistent. A
+    non-positive value disables record-count splitting.
+    """
+    max_records_per_batch = int(
+        os.getenv(
+            "MONGO_DELETE_MAX_RECORDS_PER_BATCH",
+            str(DEFAULT_MONGO_DELETE_MAX_RECORDS_PER_BATCH),
+        )
+    )
+    if max_records_per_batch <= 0:
+        logger.warning(
+            f"MONGO_DELETE_MAX_RECORDS_PER_BATCH={max_records_per_batch} is non-positive, disable delete record-count splitting"
+        )
+    return max_records_per_batch
+
+
+async def _run_batched_bulk_write(
+    collection,
+    ops: list[tuple[Any, int, str]],
+    *,
+    max_payload_bytes: int,
+    max_records_per_batch: int,
+    ordered: bool,
+    log_prefix: str,
+    what: str,
+) -> None:
+    """Execute UpdateOne ops as payload-size/record-count bounded bulk_write batches.
+
+    ``ops`` is a list of ``(operation, estimated_bytes, id_for_log)`` triples.
+    Splitting keeps each bulk command below MongoDB's 48MB message ceiling and
+    bounds the in-memory op list. Fail-fast: a batch failure raises and no
+    further batches run, so callers must treat the whole write as retryable
+    (UpdateOne(..., upsert=True) is idempotent).
+    """
+    if not ops:
+        return
+
+    batches = _chunk_by_budget(
+        ops, lambda triple: triple[1], max_payload_bytes, max_records_per_batch
+    )
+    if len(batches) > 1:
+        logger.info(
+            f"{log_prefix} {what} split into {len(batches)} batches "
+            f"for {len(ops)} records"
+        )
+    for batch_index, (batch, estimated_bytes) in enumerate(batches, 1):
+        if (
+            len(batch) == 1
+            and max_payload_bytes > 0
+            and estimated_bytes > max_payload_bytes
+        ):
+            logger.warning(
+                f"{log_prefix} {what}: single record id={batch[0][2]} "
+                f"estimated {estimated_bytes} bytes exceeds {max_payload_bytes}"
+            )
+        logger.debug(
+            f"{log_prefix} {what} batch {batch_index}/{len(batches)}: "
+            f"records={len(batch)}, estimated_payload_bytes={estimated_bytes}"
+        )
+        await collection.bulk_write([triple[0] for triple in batch], ordered=ordered)
+
+
+class ClientManager:
+    _instances: dict = {"client": None, "db": None, "ref_count": 0}
+    _lock = asyncio.Lock()
+
+    @classmethod
+    async def get_client(cls) -> AsyncMongoClient:
+        async with cls._lock:
+            if cls._instances["db"] is None:
+                uri = os.environ.get(
+                    "MONGO_URI",
+                    config.get(
+                        "mongodb",
+                        "uri",
+                        fallback="mongodb://root:root@localhost:27017/",
+                    ),
+                )
+                database_name = os.environ.get(
+                    "MONGO_DATABASE",
+                    config.get("mongodb", "database", fallback="LightRAG"),
+                )
+                client = AsyncMongoClient(
+                    uri,
+                    driver=DriverInfo(name="LightRAG", version=__version__),
+                )
+                db = client.get_database(database_name)
+                cls._instances["client"] = client
+                cls._instances["db"] = db
+                cls._instances["ref_count"] = 0
+            cls._instances["ref_count"] += 1
+            return cls._instances["db"]
+
+    @classmethod
+    async def release_client(cls, db: AsyncDatabase):
+        async with cls._lock:
+            if db is not None:
+                if db is cls._instances["db"]:
+                    cls._instances["ref_count"] -= 1
+                    if cls._instances["ref_count"] == 0:
+                        client = cls._instances.get("client")
+                        if client is not None:
+                            await client.close()
+                        cls._instances["client"] = None
+                        cls._instances["db"] = None
+
+
+@final
+@dataclass
+class MongoKVStorage(BaseKVStorage):
+    db: AsyncDatabase = field(default=None)
+    _data: AsyncCollection = field(default=None)
+
+    supports_strict_point_reads: ClassVar[bool] = True
+
+    def __init__(self, namespace, global_config, embedding_func, workspace=None):
+        super().__init__(
+            namespace=namespace,
+            workspace=workspace or "",
+            global_config=global_config,
+            embedding_func=embedding_func,
+        )
+        self.__post_init__()
+
+    def __post_init__(self):
+        validate_workspace(self.workspace)
+        # Check for MONGODB_WORKSPACE environment variable first (higher priority)
+        # This allows administrators to force a specific workspace for all MongoDB storage instances
+        mongodb_workspace = os.environ.get("MONGODB_WORKSPACE")
+        if mongodb_workspace and mongodb_workspace.strip():
+            # Use environment variable value, overriding the passed workspace parameter
+            effective_workspace = mongodb_workspace.strip()
+            logger.info(
+                f"Using MONGODB_WORKSPACE environment variable: '{effective_workspace}' (overriding '{self.workspace}/{self.namespace}')"
+            )
+        else:
+            # Use the workspace parameter passed during initialization
+            effective_workspace = self.workspace
+            if effective_workspace:
+                logger.debug(
+                    f"Using passed workspace parameter: '{effective_workspace}'"
+                )
+
+        # Build final_namespace with workspace prefix for data isolation
+        # Keep original namespace unchanged for type detection logic
+        if effective_workspace:
+            self.final_namespace = f"{effective_workspace}_{self.namespace}"
+            self.workspace = effective_workspace
+            logger.debug(
+                f"Final namespace with workspace prefix: '{self.final_namespace}'"
+            )
+        else:
+            # When workspace is empty, final_namespace equals original namespace
+            self.final_namespace = self.namespace
+            self.workspace = ""
+            logger.debug(
+                f"[{self.workspace}] Final namespace (no workspace): '{self.namespace}'"
+            )
+
+        self._collection_name = self.final_namespace
+        (
+            self._max_upsert_payload_bytes,
+            self._max_upsert_records_per_batch,
+        ) = _resolve_upsert_batch_limits()
+
+    async def initialize(self):
+        async with get_data_init_lock():
+            if self.db is None:
+                self.db = await ClientManager.get_client()
+
+            self._data = await get_or_create_collection(self.db, self._collection_name)
+            logger.debug(
+                f"[{self.workspace}] Use MongoDB as KV {self._collection_name}"
+            )
+
+    async def finalize(self):
+        if self.db is not None:
+            await ClientManager.release_client(self.db)
+            self.db = None
+            self._data = None
+
+    async def get_by_id(self, id: str) -> dict[str, Any] | None:
+        # Unified handling for flattened keys
+        doc = await self._data.find_one({"_id": id})
+        if doc:
+            # Ensure time fields are present, provide default values for old data
+            doc.setdefault("create_time", 0)
+            doc.setdefault("update_time", 0)
+        return doc
+
+    async def get_by_id_strict(self, id: str) -> dict[str, Any] | None:
+        """Strict point read: complete-or-raise (base contract).
+
+        ``find_one`` either answers definitively or raises a ``PyMongoError``
+        — nothing is swallowed on this path, so a ``None`` IS a confirmed
+        absence (the FAILED-stub deletion path may act on it).
+        """
+        return await self.get_by_id(id)
+
+    async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+        cursor = self._data.find({"_id": {"$in": ids}})
+        docs = await cursor.to_list(length=None)
+
+        doc_map: dict[str, dict[str, Any]] = {}
+        for doc in docs:
+            if not doc:
+                continue
+            doc.setdefault("create_time", 0)
+            doc.setdefault("update_time", 0)
+            doc_map[str(doc.get("_id"))] = doc
+
+        ordered_results: list[dict[str, Any] | None] = []
+        for id_value in ids:
+            ordered_results.append(doc_map.get(str(id_value)))
+        return ordered_results
+
+    async def filter_keys(self, keys: set[str]) -> set[str]:
+        cursor = self._data.find({"_id": {"$in": list(keys)}}, {"_id": 1})
+        existing_ids = {str(x["_id"]) async for x in cursor}
+        return keys - existing_ids
+
+    async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        logger.debug(f"[{self.workspace}] Inserting {len(data)} to {self.namespace}")
+        if not data:
+            return
+
+        # Unified handling for all namespaces with flattened keys. KV docs
+        # (full_docs, text_chunks, llm_response_cache) can be large, so the
+        # upsert is split into payload-bounded bulk_write batches.
+        operations: list[tuple[Any, int, str]] = []
+        current_time = int(time.time())  # Get current Unix timestamp
+
+        for i, (k, v) in enumerate(data.items(), start=1):
+            # For text_chunks namespace, ensure llm_cache_list field exists
+            if self.namespace.endswith("text_chunks"):
+                if "llm_cache_list" not in v:
+                    v["llm_cache_list"] = []
+
+            # Create a copy of v for $set operation, excluding create_time to avoid conflicts
+            v_for_set = v.copy()
+            v_for_set["_id"] = k  # Use flattened key as _id
+            v_for_set["update_time"] = current_time  # Always update update_time
+
+            # Remove create_time from $set to avoid conflict with $setOnInsert
+            v_for_set.pop("create_time", None)
+
+            operations.append(
+                (
+                    UpdateOne(
+                        {"_id": k},
+                        {
+                            "$set": v_for_set,  # Update all fields except create_time
+                            "$setOnInsert": {
+                                "create_time": current_time
+                            },  # Set create_time only on insert
+                        },
+                        upsert=True,
+                    ),
+                    _estimate_doc_bytes(v_for_set),
+                    k,
+                )
+            )
+            await _cooperative_yield(i)
+
+        # ordered=False (intentional): the old single bulk_write used pymongo's
+        # default ordered=True, but every op targets a distinct flattened _id, so
+        # the writes are order-independent. ordered=False lets the server apply
+        # them in parallel and is the right choice for idempotent upserts.
+        await _run_batched_bulk_write(
+            self._data,
+            operations,
+            max_payload_bytes=self._max_upsert_payload_bytes,
+            max_records_per_batch=self._max_upsert_records_per_batch,
+            ordered=False,
+            log_prefix=f"[{self.workspace}] {self.namespace} upsert:",
+            what="upsert",
+        )
+
+    async def index_done_callback(self) -> None:
+        # Mongo handles persistence automatically
+        pass
+
+    async def is_empty(self) -> bool:
+        """Check if the storage is empty for the current workspace and namespace
+
+        Returns:
+            bool: True if storage is empty, False otherwise
+        """
+        try:
+            # Use count_documents with limit 1 for efficiency
+            count = await self._data.count_documents({}, limit=1)
+            return count == 0
+        except PyMongoError as e:
+            logger.error(f"[{self.workspace}] Error checking if storage is empty: {e}")
+            return True
+
+    async def delete(self, ids: list[str]) -> None:
+        """Delete documents with specified IDs
+
+        Args:
+            ids: List of document IDs to be deleted
+        """
+        if not ids:
+            return
+
+        # Convert to list if it's a set (MongoDB BSON cannot encode sets)
+        if isinstance(ids, set):
+            ids = list(ids)
+
+        try:
+            result = await self._data.delete_many({"_id": {"$in": ids}})
+            logger.info(
+                f"[{self.workspace}] Deleted {result.deleted_count} documents from {self.namespace}"
+            )
+        except PyMongoError as e:
+            logger.error(
+                f"[{self.workspace}] Error deleting documents from {self.namespace}: {e}"
+            )
+
+    async def drop(self) -> dict[str, str]:
+        """Drop the storage by removing all documents in the collection.
+
+        Returns:
+            dict[str, str]: Status of the operation with keys 'status' and 'message'
+        """
+        try:
+            result = await self._data.delete_many({})
+            deleted_count = result.deleted_count
+
+            logger.info(
+                f"[{self.workspace}] Dropped {deleted_count} documents from doc status {self._collection_name}"
+            )
+            return {
+                "status": "success",
+                "message": f"{deleted_count} documents dropped",
+            }
+        except PyMongoError as e:
+            logger.error(
+                f"[{self.workspace}] Error dropping doc status {self._collection_name}: {e}"
+            )
+            return {"status": "error", "message": str(e)}
+
+
+@final
+@dataclass
+class MongoDocStatusStorage(DocStatusStorage):
+    db: AsyncDatabase = field(default=None)
+    _data: AsyncCollection = field(default=None)
+
+    supports_strict_point_reads: ClassVar[bool] = True
+
+    # Bounded upper limit on the sample of conflicting doc IDs surfaced by the
+    # source-conflict listing/repair APIs — never materialize the whole set.
+    _CONFLICT_SAMPLE_CAP: ClassVar[int] = 32
+
+    def _prepare_doc_status_data(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """Normalize and migrate a raw Mongo document to DocProcessingStatus-compatible dict."""
+        # Make a copy of the data to avoid modifying the original
+        data = doc.copy()
+        # Remove deprecated content field if it exists
+        data.pop("content", None)
+        # Remove MongoDB _id field if it exists
+        data.pop("_id", None)
+        # If file_path is not in data, use document id as file path
+        if "file_path" not in data:
+            data["file_path"] = "no-file-path"
+        # Ensure new fields exist with default values
+        if "metadata" not in data:
+            data["metadata"] = {}
+        if "error_msg" not in data:
+            data["error_msg"] = None
+        # Backward compatibility: migrate legacy 'error' field to 'error_msg'
+        if "error" in data:
+            if "error_msg" not in data or data["error_msg"] in (None, ""):
+                data["error_msg"] = data.pop("error")
+            else:
+                data.pop("error", None)
+        return data
+
+    def _mongo_doc_processing_status_from_doc(
+        self, doc: dict[str, Any]
+    ) -> DocProcessingStatus:
+        """Normalise a raw Mongo document into a FULL DocProcessingStatus.
+
+        Single source of the raw -> status construction shared by
+        ``get_docs_by_statuses`` and the ``get_full_docs_by_ids`` hydration
+        path. Raises ``KeyError``/``TypeError`` on a malformed document
+        (``TypeError`` is what construction raises on missing required
+        fields); the caller decides strict (raise) vs relaxed (skip).
+        Fields the dataclass does not declare are tolerated — see
+        ``DocProcessingStatus.from_stored``.
+        """
+        data = self._prepare_doc_status_data(doc)
+        return DocProcessingStatus.from_stored(data)
+
+    def __init__(self, namespace, global_config, embedding_func, workspace=None):
+        super().__init__(
+            namespace=namespace,
+            workspace=workspace or "",
+            global_config=global_config,
+            embedding_func=embedding_func,
+        )
+        self.__post_init__()
+
+    def __post_init__(self):
+        validate_workspace(self.workspace)
+        # Check for MONGODB_WORKSPACE environment variable first (higher priority)
+        # This allows administrators to force a specific workspace for all MongoDB storage instances
+        mongodb_workspace = os.environ.get("MONGODB_WORKSPACE")
+        if mongodb_workspace and mongodb_workspace.strip():
+            # Use environment variable value, overriding the passed workspace parameter
+            effective_workspace = mongodb_workspace.strip()
+            logger.info(
+                f"Using MONGODB_WORKSPACE environment variable: '{effective_workspace}' (overriding '{self.workspace}/{self.namespace}')"
+            )
+        else:
+            # Use the workspace parameter passed during initialization
+            effective_workspace = self.workspace
+            if effective_workspace:
+                logger.debug(
+                    f"Using passed workspace parameter: '{effective_workspace}'"
+                )
+
+        # Build final_namespace with workspace prefix for data isolation
+        # Keep original namespace unchanged for type detection logic
+        if effective_workspace:
+            self.final_namespace = f"{effective_workspace}_{self.namespace}"
+            self.workspace = effective_workspace
+            logger.debug(
+                f"Final namespace with workspace prefix: '{self.final_namespace}'"
+            )
+        else:
+            # When workspace is empty, final_namespace equals original namespace
+            self.final_namespace = self.namespace
+            self.workspace = ""
+            logger.debug(f"Final namespace (no workspace): '{self.final_namespace}'")
+
+        self._collection_name = self.final_namespace
+
+    async def initialize(self):
+        async with get_data_init_lock():
+            if self.db is None:
+                self.db = await ClientManager.get_client()
+
+            self._data = await get_or_create_collection(self.db, self._collection_name)
+
+            # Create and migrate all indexes including Chinese collation for file_path
+            await self.create_and_migrate_indexes_if_not_exists()
+
+            logger.debug(
+                f"[{self.workspace}] Use MongoDB as DocStatus {self._collection_name}"
+            )
+
+    async def finalize(self):
+        if self.db is not None:
+            await ClientManager.release_client(self.db)
+            self.db = None
+            self._data = None
+
+    async def get_by_id(self, id: str) -> Union[dict[str, Any], None]:
+        return await self._data.find_one({"_id": id})
+
+    async def get_by_id_strict(self, id: str) -> Union[dict[str, Any], None]:
+        """Strict point read: complete-or-raise (base contract).
+
+        ``find_one`` either answers definitively or raises a ``PyMongoError``
+        — nothing is swallowed on this path, so a ``None`` IS a confirmed
+        absence.
+        """
+        return await self._data.find_one({"_id": id})
+
+    async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+        cursor = self._data.find({"_id": {"$in": ids}})
+        docs = await cursor.to_list(length=None)
+
+        doc_map: dict[str, dict[str, Any]] = {}
+        for doc in docs:
+            if not doc:
+                continue
+            doc_map[str(doc.get("_id"))] = doc
+
+        ordered_results: list[dict[str, Any] | None] = []
+        for id_value in ids:
+            ordered_results.append(doc_map.get(str(id_value)))
+        return ordered_results
+
+    async def filter_keys(self, data: set[str]) -> set[str]:
+        cursor = self._data.find({"_id": {"$in": list(data)}}, {"_id": 1})
+        existing_ids = {str(x["_id"]) async for x in cursor}
+        return data - existing_ids
+
+    async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        logger.debug(f"[{self.workspace}] Inserting {len(data)} to {self.namespace}")
+        if not data:
+            return
+        update_tasks: list[Any] = []
+        for i, (k, v) in enumerate(data.items(), start=1):
+            # Ensure chunks_list field exists and is an array
+            if "chunks_list" not in v:
+                v["chunks_list"] = []
+            data[k]["_id"] = k
+            update_tasks.append(
+                self._data.update_one({"_id": k}, {"$set": v}, upsert=True)
+            )
+            await _cooperative_yield(i)
+        await asyncio.gather(*update_tasks)
+
+    async def get_status_counts(self) -> dict[str, int]:
+        """Get counts of documents in each status"""
+        pipeline = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
+        cursor = await self._data.aggregate(pipeline, allowDiskUse=True)
+        result = await cursor.to_list()
+        counts = {}
+        for doc in result:
+            counts[doc["_id"]] = doc["count"]
+        return counts
+
+    async def get_docs_by_statuses(
+        self, statuses: list[DocStatus], strict: bool = False
+    ) -> dict[str, DocProcessingStatus]:
+        """Get all documents matching any of the given statuses in a single query.
+
+        Uses MongoDB's $in operator to fetch all matching statuses in one
+        round-trip instead of one find() call per status.  Transport errors
+        always propagate; ``strict=True`` additionally raises on any record
+        that cannot be converted (complete-or-raise scheduling contract, see
+        base class).
+        """
+        if not statuses:
+            return {}
+        status_values = [s.value for s in statuses]
+        cursor = self._data.find({"status": {"$in": status_values}})
+        docs = await cursor.to_list(length=None)
+        result = {}
+        for doc in docs:
+            try:
+                result[doc["_id"]] = self._mongo_doc_processing_status_from_doc(doc)
+            except (KeyError, TypeError) as e:
+                # TypeError is what DocProcessingStatus(**data) actually raises
+                # on missing required fields — without it here, the relaxed
+                # skip-and-log contract silently becomes crash-the-whole-call.
+                logger.error(
+                    f"[{self.workspace}] Missing required field for document {doc['_id']}: {e}"
+                )
+                if strict:
+                    raise
+                continue
+        return result
+
+    async def get_docs_by_track_id(
+        self, track_id: str
+    ) -> dict[str, DocProcessingStatus]:
+        """Get all documents with a specific track_id"""
+        cursor = self._data.find({"track_id": track_id})
+        result = await cursor.to_list()
+        processed_result = {}
+        for doc in result:
+            doc_id_hint = doc.get("_id", "<unknown>") if doc else "<unknown>"
+            try:
+                processed_result[doc["_id"]] = (
+                    self._mongo_doc_processing_status_from_doc(doc)
+                )
+            except (KeyError, TypeError) as e:
+                # TypeError, not just KeyError: DocProcessingStatus is a
+                # dataclass, so a row missing a required field (or carrying an
+                # unknown one) raises TypeError. Catching KeyError alone left
+                # the real failure uncaught and crashed the whole listing.
+                logger.error(
+                    f"[{self.workspace}] Missing required field for document "
+                    f"{doc_id_hint}: {e}"
+                )
+                continue
+        return processed_result
+
+    async def index_done_callback(self) -> None:
+        # Mongo handles persistence automatically
+        pass
+
+    async def is_empty(self) -> bool:
+        """Check if the storage is empty for the current workspace and namespace
+
+        Returns:
+            bool: True if storage is empty, False otherwise
+        """
+        try:
+            # Use count_documents with limit 1 for efficiency
+            count = await self._data.count_documents({}, limit=1)
+            return count == 0
+        except PyMongoError as e:
+            logger.error(f"[{self.workspace}] Error checking if storage is empty: {e}")
+            return True
+
+    async def drop(self) -> dict[str, str]:
+        """Drop the storage by removing all documents in the collection.
+
+        Returns:
+            dict[str, str]: Status of the operation with keys 'status' and 'message'
+        """
+        try:
+            result = await self._data.delete_many({})
+            deleted_count = result.deleted_count
+
+            logger.info(
+                f"[{self.workspace}] Dropped {deleted_count} documents from doc status {self._collection_name}"
+            )
+            return {
+                "status": "success",
+                "message": f"{deleted_count} documents dropped",
+            }
+        except PyMongoError as e:
+            logger.error(
+                f"[{self.workspace}] Error dropping doc status {self._collection_name}: {e}"
+            )
+            return {"status": "error", "message": str(e)}
+
+    async def delete(self, ids: list[str]) -> None:
+        # Convert to list if it's a set (MongoDB BSON cannot encode sets)
+        if isinstance(ids, set):
+            ids = list(ids)
+        await self._data.delete_many({"_id": {"$in": ids}})
+
+    async def create_and_migrate_indexes_if_not_exists(self):
+        """Create indexes to optimize pagination queries and migrate file_path indexes for Chinese collation"""
+        try:
+            # Get indexes for the current collection only
+            indexes_cursor = await self._data.list_indexes()
+            existing_indexes = await indexes_cursor.to_list(length=None)
+            existing_index_names = {idx.get("name", "") for idx in existing_indexes}
+
+            # Define collation configuration for Chinese pinyin sorting
+            collation_config = {"locale": "zh", "numericOrdering": True}
+
+            # Use workspace-specific index names to avoid cross-workspace conflicts
+            workspace_prefix = f"{self.workspace}_" if self.workspace != "" else ""
+
+            # 1. Define all indexes needed with workspace-specific names
+            all_indexes = [
+                # Original pagination indexes
+                {
+                    "name": f"{workspace_prefix}status_updated_at",
+                    "keys": [("status", 1), ("updated_at", -1)],
+                },
+                {
+                    "name": f"{workspace_prefix}status_created_at",
+                    "keys": [("status", 1), ("created_at", -1)],
+                },
+                {"name": f"{workspace_prefix}updated_at", "keys": [("updated_at", -1)]},
+                {"name": f"{workspace_prefix}created_at", "keys": [("created_at", -1)]},
+                {"name": f"{workspace_prefix}id", "keys": [("_id", 1)]},
+                {"name": f"{workspace_prefix}track_id", "keys": [("track_id", 1)]},
+                # New file_path indexes with Chinese collation and workspace-specific names
+                {
+                    "name": f"{workspace_prefix}file_path_zh_collation",
+                    "keys": [("file_path", 1)],
+                    "collation": collation_config,
+                },
+                {
+                    "name": f"{workspace_prefix}status_file_path_zh_collation",
+                    "keys": [("status", 1), ("file_path", 1)],
+                    "collation": collation_config,
+                },
+                # Partial index on content_hash for content-based dedup lookups.
+                # Mirrors the PG partial index: skip legacy/empty values so the
+                # index stays small and a content_hash="" query is a guaranteed miss.
+                {
+                    "name": f"{workspace_prefix}content_hash",
+                    "keys": [("content_hash", 1)],
+                    "partialFilterExpression": {
+                        "content_hash": {"$exists": True, "$type": "string", "$gt": ""}
+                    },
+                },
+                # Keyset sweep index for the bounded scheduling page API:
+                # matches the MUST sort of get_docs_by_statuses_page
+                # ((created_at ASC, _id ASC) within each status branch of a
+                # status $in — the server merges the per-status keysets).
+                {
+                    "name": f"{workspace_prefix}status_created_at_id_asc",
+                    "keys": [("status", 1), ("created_at", 1), ("_id", 1)],
+                },
+            ]
+
+            # 2. Handle legacy index cleanup: only drop old indexes that exist in THIS collection
+            legacy_index_names = [
+                "file_path_zh_collation",
+                "status_file_path_zh_collation",
+                "status_updated_at",
+                "status_created_at",
+                "updated_at",
+                "created_at",
+                "id",
+                "track_id",
+                "content_hash",
+            ]
+
+            for legacy_name in legacy_index_names:
+                if (
+                    legacy_name in existing_index_names
+                    and legacy_name
+                    != f"{workspace_prefix}{legacy_name.replace(workspace_prefix, '')}"
+                ):
+                    try:
+                        await self._data.drop_index(legacy_name)
+                        logger.debug(
+                            f"[{self.workspace}] Migrated: dropped legacy index '{legacy_name}' from collection {self._collection_name}"
+                        )
+                        existing_index_names.discard(legacy_name)
+                    except PyMongoError as drop_error:
+                        logger.warning(
+                            f"[{self.workspace}] Failed to drop legacy index '{legacy_name}' from collection {self._collection_name}: {drop_error}"
+                        )
+
+            # 3. Create all needed indexes with workspace-specific names
+            for index_info in all_indexes:
+                index_name = index_info["name"]
+                if index_name not in existing_index_names:
+                    create_kwargs = {"name": index_name}
+                    if "collation" in index_info:
+                        create_kwargs["collation"] = index_info["collation"]
+                    if "partialFilterExpression" in index_info:
+                        create_kwargs["partialFilterExpression"] = index_info[
+                            "partialFilterExpression"
+                        ]
+
+                    try:
+                        await self._data.create_index(
+                            index_info["keys"], **create_kwargs
+                        )
+                        logger.debug(
+                            f"[{self.workspace}] Created index '{index_name}' for collection {self._collection_name}"
+                        )
+                    except PyMongoError as create_error:
+                        # If creation still fails, log the error but continue with other indexes
+                        logger.error(
+                            f"[{self.workspace}] Failed to create index '{index_name}' for collection {self._collection_name}: {create_error}"
+                        )
+                else:
+                    logger.debug(
+                        f"[{self.workspace}] Index '{index_name}' already exists for collection {self._collection_name}"
+                    )
+
+        except PyMongoError as e:
+            logger.error(
+                f"[{self.workspace}] Error creating/migrating indexes for {self._collection_name}: {e}"
+            )
+
+    async def get_docs_paginated(
+        self,
+        status_filter: DocStatus | None = None,
+        status_filters: list[DocStatus] | None = None,
+        page: int = 1,
+        page_size: int = 50,
+        sort_field: str = "updated_at",
+        sort_direction: str = "desc",
+    ) -> tuple[list[tuple[str, DocProcessingStatus]], int]:
+        """Get documents with pagination support
+
+        Args:
+            status_filter: Filter by document status, None for all statuses
+            page: Page number (1-based)
+            page_size: Number of documents per page (10-200)
+            sort_field: Field to sort by ('created_at', 'updated_at', '_id')
+            sort_direction: Sort direction ('asc' or 'desc')
+
+        Returns:
+            Tuple of (list of (doc_id, DocProcessingStatus) tuples, total_count)
+        """
+        status_filter_values = self.resolve_status_filter_values(
+            status_filter=status_filter,
+            status_filters=status_filters,
+        )
+
+        # Validate parameters
+        if page < 1:
+            page = 1
+        if page_size < 10:
+            page_size = 10
+        elif page_size > 200:
+            page_size = 200
+
+        if sort_field not in ["created_at", "updated_at", "_id", "file_path"]:
+            sort_field = "updated_at"
+
+        if sort_direction.lower() not in ["asc", "desc"]:
+            sort_direction = "desc"
+
+        # Build query filter
+        query_filter = {}
+        if status_filter_values is not None:
+            query_filter["status"] = {"$in": sorted(status_filter_values)}
+
+        # Get total count
+        total_count = await self._data.count_documents(query_filter)
+
+        # Calculate skip value
+        skip = (page - 1) * page_size
+
+        # Build sort criteria
+        sort_direction_value = 1 if sort_direction.lower() == "asc" else -1
+        sort_criteria = [(sort_field, sort_direction_value)]
+
+        # Query for paginated data with Chinese collation for file_path sorting
+        if sort_field == "file_path":
+            # Use Chinese collation for pinyin sorting
+            cursor = (
+                self._data.find(query_filter)
+                .sort(sort_criteria)
+                .collation({"locale": "zh", "numericOrdering": True})
+                .skip(skip)
+                .limit(page_size)
+            )
+        else:
+            # Use default sorting for other fields
+            cursor = (
+                self._data.find(query_filter)
+                .sort(sort_criteria)
+                .skip(skip)
+                .limit(page_size)
+            )
+        result = await cursor.to_list(length=page_size)
+
+        # Convert to (doc_id, DocProcessingStatus) tuples
+        documents = []
+        for doc in result:
+            try:
+                doc_id = doc["_id"]
+
+                data = self._prepare_doc_status_data(doc)
+
+                doc_status = DocProcessingStatus.from_stored(data)
+                documents.append((doc_id, doc_status))
+            except KeyError as e:
+                logger.error(
+                    f"[{self.workspace}] Missing required field for document {doc['_id']}: {e}"
+                )
+                continue
+
+        return documents, total_count
+
+    async def get_all_status_counts(self) -> dict[str, int]:
+        """Get counts of documents in each status for all documents
+
+        Returns:
+            Dictionary mapping status names to counts, including 'all' field
+        """
+        pipeline = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
+        cursor = await self._data.aggregate(pipeline, allowDiskUse=True)
+        result = await cursor.to_list()
+
+        counts = {}
+        total_count = 0
+        for doc in result:
+            counts[doc["_id"]] = doc["count"]
+            total_count += doc["count"]
+
+        # Add 'all' field with total count
+        counts["all"] = total_count
+
+        return counts
+
+    async def get_doc_by_file_path(self, file_path: str) -> Union[dict[str, Any], None]:
+        """Get document by file path
+
+        Args:
+            file_path: The file path to search for
+
+        Returns:
+            Union[dict[str, Any], None]: Document data if found, None otherwise
+            Returns the same format as get_by_id method
+        """
+        return await self._data.find_one({"file_path": file_path})
+
+    async def get_doc_by_file_basename(
+        self, basename: str
+    ) -> Union[tuple[str, dict[str, Any]], None]:
+        """Mongo-native override of basename-based document lookup (legacy).
+
+        The caller is responsible for passing an already-canonical basename;
+        stored ``file_path`` values are canonicalized by the business layer, so
+        this lookup performs an exact match only and relies on the file_path
+        index created by ``create_and_migrate_indexes_if_not_exists``.
+
+        Returns the PRIMARY (``metadata.is_duplicate != true``) row only —
+        duplicate-attempt ``dup-*`` markers keep the same canonical basename
+        and must never satisfy an identity lookup. Legacy error semantics:
+        query failures are logged and read as a best-effort miss (``None``);
+        callers that need "None == confirmed absent" or conflict detection must
+        use :meth:`resolve_doc_source_strict`.
+        """
+        if not basename or basename == "unknown_source":
+            return None
+        try:
+            doc = await self._data.find_one(
+                {"file_path": basename, "metadata.is_duplicate": {"$ne": True}}
+            )
+        except PyMongoError as e:
+            logger.error(f"[{self.workspace}] Error in get_doc_by_file_basename: {e}")
+            return None
+        if not doc:
+            return None
+        doc_id = doc.get("_id")
+        if doc_id is None:
+            return None
+        return str(doc_id), doc
+
+    async def resolve_doc_source_strict(
+        self, canonical_source_key: str
+    ) -> SourceResolution:
+        """Typed, conflict-aware source resolution (see base contract).
+
+        Locates up to two PRIMARY (``metadata.is_duplicate != true``) rows via
+        an indexed ``find(...).limit(2)`` and maps 0/1/≥2 →
+        Absent/Unique/Conflict. Transport/query errors PROPAGATE (a swallowed
+        failure would read as :class:`SourceAbsent`, and scan/enqueue treat
+        Absent as "confirmed new", minting duplicate primaries). The ≥2 branch
+        runs one cheap indexed ``count_documents`` for the exact candidate
+        count surfaced in the conflict.
+        """
+        if not canonical_source_key or canonical_source_key == "unknown_source":
+            return SourceAbsent()
+
+        query = {
+            "file_path": canonical_source_key,
+            "metadata.is_duplicate": {"$ne": True},
+        }
+        cursor = self._data.find(query).limit(2)
+        rows = await cursor.to_list(length=2)
+        if not rows:
+            return SourceAbsent()
+        if len(rows) == 1:
+            doc = rows[0]
+            return SourceUnique(
+                doc_id=str(doc.get("_id")),
+                doc=self._scheduling_record_from_doc(doc, strict=True),
+            )
+        candidate_count = await self._data.count_documents(query)
+        return SourceConflict(
+            candidate_count=candidate_count,
+            sample_doc_ids=tuple(sorted(str(d.get("_id")) for d in rows)),
+        )
+
+    async def get_doc_by_content_hash(
+        self, content_hash: str, *, exclude_doc_id: str | None = None
+    ) -> Union[tuple[str, dict[str, Any]], None]:
+        """Mongo-native override of content-hash document lookup.
+
+        Uses the partial ``content_hash`` index. Empty strings are treated as a
+        miss to align with the partial-index predicate; legacy rows missing the
+        field cannot match a non-empty query because the query requires an
+        exact value. ``exclude_doc_id`` adds ``_id: {$ne: ...}`` plus a ``$nor``
+        clause dropping any row that merely POINTS at that id (``is_duplicate``
+        naming it as ``original_doc_id``), so the duplicate check excludes both
+        the doc being processed and a record of it in-query (see base contract),
+        still served by the content_hash index. Both are query predicates, so
+        skipping a pointer row cannot truncate the search — the sort + ``limit``
+        still yield the earliest row that survives them.
+
+        Fail-closed: a query error PROPAGATES. ``None`` means "confirmed no
+        other holder", which the dedup callers act on destructively — they
+        enqueue the document and ingest its content — so reporting a transport
+        failure as "no duplicate" would mint duplicate rows and duplicate
+        graph contributions.
+
+        ``sort`` makes the "earliest other holder" of the base contract real:
+        ``find_one`` alone returns whatever the index/natural order yields, so
+        the ``original_doc_id`` written into a duplicate's row would vary
+        between runs over the same data.
+        """
+        if not content_hash:
+            return None
+
+        query: dict[str, Any] = {"content_hash": content_hash}
+        if exclude_doc_id is not None:
+            query["_id"] = {"$ne": exclude_doc_id}
+            query["$nor"] = [
+                {
+                    "metadata.is_duplicate": True,
+                    "metadata.original_doc_id": exclude_doc_id,
+                }
+            ]
+        cursor = self._data.find(query).sort([("created_at", 1), ("_id", 1)]).limit(1)
+        rows = await cursor.to_list(length=1)
+        if not rows:
+            return None
+        doc = rows[0]
+        doc_id = doc.get("_id")
+        if doc_id is None:
+            return None
+        return str(doc_id), doc
+
+    # ------------------------------------------------------------------
+    # Memory-bounding scheduling API (Phase 1)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _encode_cursor(created_at: str | None, doc_id: str) -> str:
+        return json.dumps([created_at, doc_id], ensure_ascii=False)
+
+    @staticmethod
+    def _decode_cursor(opaque: str) -> tuple[str | None, str]:
+        try:
+            decoded = json.loads(opaque)
+            created, doc_id = decoded
+            if not isinstance(doc_id, str):
+                raise ValueError("cursor id must be a string")
+            if created is not None and not isinstance(created, str):
+                raise ValueError("cursor created_at must be a string or null")
+        except (ValueError, TypeError) as e:
+            raise StorageControlPlaneError(
+                f"Malformed scheduling cursor for MongoDocStatusStorage: {e}"
+            ) from e
+        return created, doc_id
+
+    @staticmethod
+    def _doc_cursor_key(doc: dict[str, Any]) -> tuple[str | None, str]:
+        """(created_at, _id) keyset key of a RAW query-returned doc.
+
+        A missing/null/non-string created_at encodes as ``None`` — the
+        missing/null bucket, which BSON sorts BEFORE every string. Encoding
+        it as ``""`` would break the resume filter: ``{"created_at": ""}``
+        matches neither a missing field nor a null value, so a second corrupt
+        row past the page boundary would silently fall out of the sweep. The
+        ``None`` marker resumes with the ``{"created_at": None}`` predicate,
+        which Mongo defines to match BOTH missing and null."""
+        created = doc.get("created_at")
+        return (created if isinstance(created, str) else None, str(doc.get("_id")))
+
+    def _scheduling_record_from_doc(
+        self, doc: dict[str, Any], *, strict: bool
+    ) -> DocSchedulingRecord | None:
+        """Project one raw Mongo doc; strict raises on unusable docs, relaxed
+        returns None (the caller still counts the doc as consumed)."""
+        doc_id = str(doc.get("_id"))
+        try:
+            status = DocStatus(str(doc["status"]))
+            created_at = doc["created_at"]
+            updated_at = doc.get("updated_at", created_at)
+            if not isinstance(created_at, str) or not isinstance(updated_at, str):
+                raise TypeError("created_at/updated_at must be strings")
+            metadata = doc.get("metadata")
+            return DocSchedulingRecord(
+                id=doc_id,
+                status=status,
+                created_at=created_at,
+                updated_at=updated_at,
+                file_path=doc.get("file_path") or "no-file-path",
+                track_id=doc.get("track_id"),
+                has_custom_chunk_journal=isinstance(metadata, dict)
+                and isinstance(metadata.get(CUSTOM_CHUNK_PATCH_METADATA_KEY), dict),
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error(f"[{self.workspace}] Unusable scheduling row {doc_id}: {e}")
+            if strict:
+                raise
+            return None
+
+    async def get_docs_by_statuses_page(
+        self,
+        statuses: list[DocStatus],
+        *,
+        limit: int,
+        position: CursorPosition = CURSOR_START,
+        strict: bool = False,
+    ) -> DocStatusPage:
+        """Bounded keyset page: one indexed ``find`` with ``sort`` + ``limit``.
+
+        ``created_at`` is stored as an ISO-8601 string, so the keyset
+        comparison stays string-typed end to end (cursor ↔ query ↔ sort).
+
+        Consumed-position contract: every predicate (status, keyset resume) is
+        evaluated SERVER-side, so the
+        set of query-returned docs IS the set of consumed records — the
+        frontier is the last RETURNED doc's ``(created_at, _id)`` key, and
+        fewer returned docs than ``limit`` proves the sweep is exhausted
+        (CURSOR_END). A relaxed-mode conversion skip drops the doc from the
+        page but the doc was still returned by the query, hence consumed:
+        the cursor advances past it (never re-read, never terminal-by-skip).
+
+        Transport/query errors always propagate (never swallowed into a
+        partial page); ``strict=True`` additionally raises on any returned
+        doc that cannot be projected to :class:`DocSchedulingRecord`.
+        """
+        if limit <= 0:
+            raise ValueError(f"page limit must be positive, got {limit}")
+        if not statuses or position is CURSOR_END:
+            return DocStatusPage(docs={}, next_position=CURSOR_END)
+
+        query: dict[str, Any] = {"status": {"$in": sorted({s.value for s in statuses})}}
+        and_clauses: list[dict[str, Any]] = []
+        if isinstance(position, CursorAfter):
+            created, doc_id = self._decode_cursor(position.opaque)
+            if created is None:
+                # Cursor inside the missing/null bucket (sorted first by
+                # BSON): continue through its remaining docs by _id —
+                # {"created_at": None} matches BOTH missing and null — then
+                # every doc with a real (non-null, existing) value.
+                and_clauses.append(
+                    {
+                        "$or": [
+                            {"created_at": None, "_id": {"$gt": doc_id}},
+                            {"created_at": {"$ne": None}},
+                        ]
+                    }
+                )
+            else:
+                # Past the missing/null bucket: string-typed $gt/$eq never
+                # match missing or null fields, which is correct — that
+                # bucket was already consumed before this cursor.
+                and_clauses.append(
+                    {
+                        "$or": [
+                            {"created_at": {"$gt": created}},
+                            {"created_at": created, "_id": {"$gt": doc_id}},
+                        ]
+                    }
+                )
+        if and_clauses:
+            query["$and"] = and_clauses
+
+        cursor = (
+            self._data.find(query).sort([("created_at", 1), ("_id", 1)]).limit(limit)
+        )
+        raw_docs = await cursor.to_list(length=limit)
+
+        docs: dict[str, DocSchedulingRecord] = {}
+        for doc in raw_docs:
+            record = self._scheduling_record_from_doc(doc, strict=strict)
+            if record is None:
+                continue  # relaxed skip: query-returned, hence still consumed
+            docs[record.id] = record
+
+        if len(raw_docs) < limit:
+            return DocStatusPage(docs=docs, next_position=CURSOR_END)
+        last_created, last_id = self._doc_cursor_key(raw_docs[-1])
+        return DocStatusPage(
+            docs=docs,
+            next_position=CursorAfter(self._encode_cursor(last_created, last_id)),
+        )
+
+    async def count_docs_by_statuses(
+        self, statuses: list[DocStatus], *, strict: bool = True
+    ) -> int:
+        """Fail-closed status count: accurate ``count_documents`` or raise
+        (errors propagate — admission control treats an error as "refuse")."""
+        if not statuses:
+            return 0
+        return await self._data.count_documents(
+            {"status": {"$in": sorted({s.value for s in statuses})}}
+        )
+
+    async def update_doc_status_fields(
+        self,
+        doc_id: str,
+        fields: dict[str, Any],
+        *,
+        missing_ok: bool = False,
+    ) -> None:
+        """Targeted ``$set`` of the given fields only (no read-modify-write,
+        so a huge ``chunks_list`` never travels through memory)."""
+        if "created_at" in fields:
+            raise ValueError(
+                "created_at is an immutable scheduling sort key and cannot "
+                "be changed via update_doc_status_fields"
+            )
+        if not fields:
+            # Mongo rejects an empty $set document; still honour the
+            # existence contract for a no-op update.
+            if missing_ok:
+                return
+            if await self._data.find_one({"_id": doc_id}, {"_id": 1}) is None:
+                raise StorageRecordNotFoundError(doc_id)
+            return
+        result = await self._data.update_one({"_id": doc_id}, {"$set": fields})
+        if result.matched_count == 0:
+            if missing_ok:
+                return
+            raise StorageRecordNotFoundError(doc_id)
+
+    # ------------------------------------------------------------------
+    # Strict batch read
+    # ------------------------------------------------------------------
+
+    async def get_docs_by_ids(
+        self,
+        doc_ids: Sequence[str],
+        *,
+        strict: bool = False,
+    ) -> dict[str, DocSchedulingRecord]:
+        """Batch strict read (see base contract).
+
+        One indexed ``find({"_id": {"$in": ids}})`` — the server answers
+        definitively or raises, so any id absent from the result set is a
+        CONFIRMED absence (never a swallowed failure). ``strict=True`` raises
+        on any returned doc that cannot be projected to
+        :class:`DocSchedulingRecord`, failing the WHOLE call rather than
+        returning a partial mapping.
+        """
+        ids = list(doc_ids)
+        if not ids:
+            return {}
+        cursor = self._data.find({"_id": {"$in": ids}})
+        raw_docs = await cursor.to_list(length=None)
+        result: dict[str, DocSchedulingRecord] = {}
+        for doc in raw_docs:
+            record = self._scheduling_record_from_doc(doc, strict=strict)
+            if record is None:
+                continue
+            result[record.id] = record
+        return result
+
+    async def get_full_docs_by_ids(
+        self,
+        doc_ids: Sequence[str],
+        *,
+        strict: bool = False,
+    ) -> dict[str, DocProcessingStatus]:
+        """Batch hydration to full DocProcessingStatus (see base contract).
+
+        One indexed ``find({"_id": {"$in": ids}})`` — the server answers
+        definitively or raises, so any id absent from the result set is a
+        CONFIRMED absence and is omitted. Reuses the SAME raw ->
+        DocProcessingStatus normalisation as ``get_docs_by_statuses``.
+        ``strict=True`` raises on any returned document that cannot be
+        converted, failing the WHOLE call rather than returning a partial
+        mapping.
+        """
+        ids = list(doc_ids)
+        if not ids:
+            return {}
+        cursor = self._data.find({"_id": {"$in": ids}})
+        raw_docs = await cursor.to_list(length=None)
+        result: dict[str, DocProcessingStatus] = {}
+        for doc in raw_docs:
+            try:
+                result[doc["_id"]] = self._mongo_doc_processing_status_from_doc(doc)
+            except (KeyError, TypeError) as e:
+                logger.error(
+                    f"[{self.workspace}] Unusable doc_status document hydrating "
+                    f"{doc.get('_id')}: {e}"
+                )
+                if strict:
+                    raise
+                continue
+        return result
+
+    # ------------------------------------------------------------------
+    # Source-conflict listing and explicit CAS repair
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _conflict_fingerprint(sorted_doc_ids: list[str]) -> str:
+        """Deterministic digest over candidate doc IDs in stable sort order."""
+        digest = hashlib.sha256()
+        for doc_id in sorted_doc_ids:
+            digest.update(doc_id.encode("utf-8"))
+            digest.update(b"\x00")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _decode_conflict_cursor(opaque: str) -> str:
+        try:
+            key = json.loads(opaque)
+            if not isinstance(key, str):
+                raise ValueError("conflict cursor must be a string")
+        except (ValueError, TypeError) as e:
+            raise StorageControlPlaneError(
+                f"Malformed source-conflict cursor for MongoDocStatusStorage: {e}"
+            ) from e
+        return key
+
+    async def _primary_candidates(
+        self, canonical_source_key: str, *, session: Any = None
+    ) -> list[str]:
+        """Sorted primary (``metadata.is_duplicate != true``) doc IDs for a
+        canonical key, projecting only ``_id`` (optionally in a session)."""
+        cursor = self._data.find(
+            {"file_path": canonical_source_key, "metadata.is_duplicate": {"$ne": True}},
+            {"_id": 1},
+            session=session,
+        )
+        rows = await cursor.to_list(length=None)
+        return sorted(str(r.get("_id")) for r in rows)
+
+    async def _primary_candidate_sample(
+        self, canonical_source_key: str
+    ) -> tuple[str, ...]:
+        """The lexicographically first ``_CONFLICT_SAMPLE_CAP`` primary ids.
+
+        Server-side bounded: ``sort(_id) + limit(cap)`` projecting only ``_id``,
+        so a key with a pathological number of primaries still ships a fixed
+        sample (unlike an aggregation ``$push`` of every id).
+        """
+        cursor = (
+            self._data.find(
+                {
+                    "file_path": canonical_source_key,
+                    "metadata.is_duplicate": {"$ne": True},
+                },
+                {"_id": 1},
+            )
+            .sort([("_id", 1)])
+            .limit(self._CONFLICT_SAMPLE_CAP)
+        )
+        rows = await cursor.to_list(length=self._CONFLICT_SAMPLE_CAP)
+        return tuple(str(r.get("_id")) for r in rows)
+
+    async def list_source_conflicts_page(
+        self,
+        *,
+        limit: int,
+        position: CursorPosition = CURSOR_START,
+    ) -> SourceConflictPage:
+        """Page canonical source keys with >1 primary candidate (see base).
+
+        A server-side aggregation groups PRIMARY (``metadata.is_duplicate !=
+        true``) rows by ``file_path``, keeps groups with candidate count ≥ 2,
+        resumes strictly after the cursor's canonical key (``$gt``) and sorts
+        by canonical key so the keyset is stable.
+
+        The accumulator is COUNT-ONLY: ``$push``-ing the ids would build one
+        array per distinct ``file_path`` in the workspace — every group, not
+        just the conflicting ones, since ``candidate_count >= 2`` can only be
+        applied AFTER ``$group`` — so peak aggregation memory would scale with
+        the document count instead of the number of source keys. Samples are
+        instead fetched per SURFACED key (at most ``limit`` bounded queries),
+        so nothing unbounded crosses the wire either. Detecting "keys with more
+        than one primary" inherently groups the whole collection, so the group
+        set itself still scales with the number of distinct source keys (as it
+        does on PostgreSQL) — ``allowDiskUse`` covers that.
+        """
+        if limit <= 0:
+            raise ValueError(f"page limit must be positive, got {limit}")
+        if position is CURSOR_END:
+            return SourceConflictPage(conflicts=(), next_position=CURSOR_END)
+
+        match: dict[str, Any] = {
+            "file_path": {
+                "$type": "string",
+                "$nin": ["", "unknown_source", "no-file-path"],
+            },
+            "metadata.is_duplicate": {"$ne": True},
+        }
+        if isinstance(position, CursorAfter):
+            match["file_path"]["$gt"] = self._decode_conflict_cursor(position.opaque)
+
+        pipeline = [
+            {"$match": match},
+            {"$group": {"_id": "$file_path", "candidate_count": {"$sum": 1}}},
+            {"$match": {"candidate_count": {"$gte": 2}}},
+            {"$sort": {"_id": 1}},
+            {"$limit": limit},
+        ]
+        cursor = await self._data.aggregate(pipeline, allowDiskUse=True)
+        groups = await cursor.to_list(length=limit)
+
+        summaries: list[SourceConflictSummary] = []
+        for group in groups:
+            canonical = str(group["_id"])
+            summaries.append(
+                SourceConflictSummary(
+                    canonical_source_key=canonical,
+                    candidate_count=int(group["candidate_count"]),
+                    sample_doc_ids=await self._primary_candidate_sample(canonical),
+                )
+            )
+        conflicts = tuple(summaries)
+        if len(groups) < limit:
+            next_position: CursorPosition = CURSOR_END
+        else:
+            next_position = CursorAfter(
+                json.dumps(str(groups[-1]["_id"]), ensure_ascii=False)
+            )
+        return SourceConflictPage(conflicts=conflicts, next_position=next_position)
+
+    async def repair_source_conflict(
+        self,
+        canonical_source_key: str,
+        *,
+        primary_doc_id: str,
+        expected_candidate_count: int,
+        expected_candidate_fingerprint: str,
+        dry_run: bool = True,
+    ) -> SourceConflictRepairResult:
+        """Demote all-but-one primary to duplicate, CAS-guarded (see base).
+
+        A dry run reads the current candidate set and returns the
+        count/fingerprint the operator must echo back. A commit re-reads the
+        candidates INSIDE a Mongo transaction; if the count/fingerprint no
+        longer match the echoed expectation it raises
+        ``SourceConflictRepairCASError`` (CAS — never overwrites a concurrent
+        change) and the transaction aborts. Otherwise every losing candidate
+        is marked ``metadata.is_duplicate=true`` +
+        ``original_doc_id=primary_doc_id`` in the same transaction (content is
+        never deleted). ``primary_doc_id`` absent from the current candidate
+        set raises ``ValueError``.
+
+        The transaction gives snapshot isolation, not predicate locking: a new
+        primary INSERTed for the same canonical key mid-repair is a phantom the
+        snapshot never sees and no write conflict reports. See the base contract
+        for what ``committed`` does and does not claim, and for the caller-side
+        keyed lock that serializes repair against enqueue.
+        """
+        if dry_run:
+            candidates = await self._primary_candidates(canonical_source_key)
+            count = len(candidates)
+            fingerprint = self._conflict_fingerprint(candidates)
+            if primary_doc_id not in candidates:
+                raise ValueError(
+                    f"primary_doc_id {primary_doc_id!r} is not a current primary "
+                    f"candidate for {canonical_source_key!r}"
+                )
+            demoted = [d for d in candidates if d != primary_doc_id]
+            return SourceConflictRepairResult(
+                canonical_source_key=canonical_source_key,
+                primary_doc_id=primary_doc_id,
+                candidate_count=count,
+                fingerprint=fingerprint,
+                demoted_sample_doc_ids=tuple(demoted[: self._CONFLICT_SAMPLE_CAP]),
+                committed=False,
+            )
+
+        async with self.db.client.start_session() as session:
+            async with await session.start_transaction():
+                candidates = await self._primary_candidates(
+                    canonical_source_key, session=session
+                )
+                count = len(candidates)
+                fingerprint = self._conflict_fingerprint(candidates)
+                if primary_doc_id not in candidates:
+                    raise ValueError(
+                        f"primary_doc_id {primary_doc_id!r} is not a current "
+                        f"primary candidate for {canonical_source_key!r}"
+                    )
+                if (
+                    count != expected_candidate_count
+                    or fingerprint != expected_candidate_fingerprint
+                ):
+                    raise SourceConflictRepairCASError(
+                        f"[{self.workspace}] source-conflict repair CAS failed for "
+                        f"{canonical_source_key!r}: candidate set changed "
+                        f"(count {count} vs {expected_candidate_count})"
+                    )
+                demoted = [d for d in candidates if d != primary_doc_id]
+                if demoted:
+                    await self._data.update_many(
+                        {"_id": {"$in": demoted}},
+                        {
+                            "$set": {
+                                "metadata.is_duplicate": True,
+                                "metadata.original_doc_id": primary_doc_id,
+                            }
+                        },
+                        session=session,
+                    )
+        return SourceConflictRepairResult(
+            canonical_source_key=canonical_source_key,
+            primary_doc_id=primary_doc_id,
+            candidate_count=count,
+            fingerprint=fingerprint,
+            demoted_sample_doc_ids=tuple(demoted[: self._CONFLICT_SAMPLE_CAP]),
+            committed=True,
+        )
+
+
+@final
+@dataclass
+class MongoGraphStorage(BaseGraphStorage):
+    """
+    A concrete implementation using MongoDB's $graphLookup to demonstrate multi-hop queries.
+    """
+
+    db: AsyncDatabase = field(default=None)
+    # node collection storing node_id, node_properties
+    collection: AsyncCollection = field(default=None)
+    # edge collection storing source_node_id, target_node_id, and edge_properties
+    edgeCollection: AsyncCollection = field(default=None)
+
+    def __init__(self, namespace, global_config, embedding_func, workspace=None):
+        super().__init__(
+            namespace=namespace,
+            workspace=workspace or "",
+            global_config=global_config,
+            embedding_func=embedding_func,
+        )
+        validate_workspace(self.workspace)
+        # Check for MONGODB_WORKSPACE environment variable first (higher priority)
+        # This allows administrators to force a specific workspace for all MongoDB storage instances
+        mongodb_workspace = os.environ.get("MONGODB_WORKSPACE")
+        if mongodb_workspace and mongodb_workspace.strip():
+            # Use environment variable value, overriding the passed workspace parameter
+            effective_workspace = mongodb_workspace.strip()
+            logger.info(
+                f"Using MONGODB_WORKSPACE environment variable: '{effective_workspace}' (overriding '{self.workspace}/{self.namespace}')"
+            )
+        else:
+            # Use the workspace parameter passed during initialization
+            effective_workspace = self.workspace
+            if effective_workspace:
+                logger.debug(
+                    f"Using passed workspace parameter: '{effective_workspace}'"
+                )
+
+        # Build final_namespace with workspace prefix for data isolation
+        # Keep original namespace unchanged for type detection logic
+        if effective_workspace:
+            self.final_namespace = f"{effective_workspace}_{self.namespace}"
+            self.workspace = effective_workspace
+            logger.debug(
+                f"Final namespace with workspace prefix: '{self.final_namespace}'"
+            )
+        else:
+            # When workspace is empty, final_namespace equals original namespace
+            self.final_namespace = self.namespace
+            self.workspace = ""
+            logger.debug(f"Final namespace (no workspace): '{self.final_namespace}'")
+
+        self._collection_name = self.final_namespace
+        self._edge_collection_name = f"{self._collection_name}_edges"
+        (
+            self._max_upsert_payload_bytes,
+            self._max_upsert_records_per_batch,
+        ) = _resolve_upsert_batch_limits()
+        self._max_delete_records_per_batch = _resolve_delete_batch_limit()
+
+    async def initialize(self):
+        async with get_data_init_lock():
+            if self.db is None:
+                self.db = await ClientManager.get_client()
+
+            self.collection = await get_or_create_collection(
+                self.db, self._collection_name
+            )
+            self.edge_collection = await get_or_create_collection(
+                self.db, self._edge_collection_name
+            )
+
+            # Create Atlas Search index for better search performance if possible
+            await self.create_search_index_if_not_exists()
+
+            # Fail-fast: migrate legacy edges to canonical endpoint fields and
+            # build the unique index before serving (upsert relies on it). Raises
+            # on failure so startup aborts rather than serving a half-migrated graph.
+            await self.create_edge_indexes_and_migrate_if_not_exists()
+
+            logger.debug(
+                f"[{self.workspace}] Use MongoDB as KG {self._collection_name}"
+            )
+
+    async def finalize(self):
+        if self.db is not None:
+            await ClientManager.release_client(self.db)
+            self.db = None
+            self.collection = None
+            self.edge_collection = None
+
+    async def create_edge_indexes_and_migrate_if_not_exists(self) -> None:
+        """Create the compound unique edge-endpoint index, migrating legacy edges first.
+
+        Fail-fast one-time migration (mirrors the OpenSearch canonical-id work):
+
+          1. dedupe legacy reciprocal duplicate docs, **merging the full relation
+             payload** into the survivor (provenance unioned, keywords
+             set-unioned, descriptions joined, weight summed — like
+             ``_merge_edges_then_upsert``) so no relation evidence is lost;
+          2. backfill the canonical ``edge_lo`` / ``edge_hi`` endpoints on every
+             remaining doc;
+          3. build the partial **compound** unique index on ``(edge_lo, edge_hi)``.
+
+        The endpoints are two separate fields (not a delimiter-joined string), so
+        distinct pairs never collide even if an id contains the would-be
+        delimiter — no input sanitisation required.
+
+        The index doubles as the completion flag: if it already exists we skip.
+        Anything failing raises, so ``initialize``/startup aborts rather than
+        serving a half-migrated collection (the upsert filter relies on every doc
+        having ``edge_lo``/``edge_hi``). Runs inside ``get_data_init_lock``, so
+        only the first worker of a deployment migrates; the rest skip on the index.
+
+        Assumes no concurrent *old-version* writer adds endpoint-less docs after
+        this completes (true for stop-the-world / single-deployment restarts). A
+        true rolling deploy with mixed code versions writing one collection could
+        leave a straggler duplicate; the remedy is to drop the
+        ``edge_endpoints_unique`` index and let the next startup re-migrate.
+        """
+        workspace_prefix = f"{self.workspace}_" if self.workspace != "" else ""
+        index_name = f"{workspace_prefix}edge_endpoints_unique"
+
+        indexes_cursor = await self.edge_collection.list_indexes()
+        existing_indexes = await indexes_cursor.to_list(length=None)
+        if any(idx.get("name") == index_name for idx in existing_indexes):
+            logger.info(
+                f"[{self.workspace}] Edge collection {self._edge_collection_name} "
+                f"already on canonical edge endpoints; skipping migration"
+            )
+            return
+
+        # Best-effort total for an X/total denominator (estimated_document_count
+        # is O(1) metadata); migration still works if it is unavailable.
+        try:
+            total = await self.edge_collection.estimated_document_count()
+        except PyMongoError:
+            total = None
+        logger.info(
+            f"[{self.workspace}] Starting canonical edge migration for "
+            f"{self._edge_collection_name}"
+            + (f" (~{total} edges to scan)" if total is not None else "")
+        )
+
+        removed = await self._dedupe_legacy_edges()
+        backfilled = await self._backfill_edge_endpoints()
+        # The unique index is the completion flag — only created on full success.
+        # unique build raises if any duplicate slipped through (e.g. a concurrent
+        # old-version writer), which fails startup so the next run retries.
+        await self.edge_collection.create_index(
+            [("edge_lo", 1), ("edge_hi", 1)],
+            name=index_name,
+            unique=True,
+            partialFilterExpression={
+                "edge_lo": {"$exists": True, "$type": "string"},
+                "edge_hi": {"$exists": True, "$type": "string"},
+            },
+        )
+        scanned = total if total is not None else "?"
+        logger.info(
+            f"[{self.workspace}] Canonical edge migration complete for "
+            f"{self._edge_collection_name}: scanned {scanned}, deduped {removed}, "
+            f"backfilled {backfilled}"
+        )
+
+    async def _dedupe_legacy_edges(self) -> int:
+        """Collapse duplicate docs for the same undirected edge into one.
+
+        Groups by the canonical (sorted) endpoint pair; for each group with more
+        than one doc, keeps the newest by ``created_at`` and **merges the
+        non-survivors' relation payload into it before deleting them** so no
+        relation evidence is lost: ``source_ids``/``source_id``/``file_path`` and
+        ``description`` are unioned over their ``GRAPH_FIELD_SEP`` components,
+        ``keywords`` are comma-set-unioned, and ``weight`` is **summed** (like
+        ``_merge_edges_then_upsert`` — duplicate docs carry separate accumulated
+        weight).
+
+        The merge is **idempotent across retries**: if a transient error aborts
+        startup after the survivor update but before the delete, the next run
+        re-processes the same group and must produce the same survivor. The union
+        fields union their split components (re-merging an already-merged
+        survivor is a no-op), and the weight sum counts the survivor's current
+        weight once plus each other duplicate only while its source_ids are not
+        yet folded into the survivor — so a retry (whose survivor already
+        contains them) does not double-count. Returns the number of docs removed.
+        """
+        pipeline = [
+            {
+                "$group": {
+                    "_id": {
+                        "lo": {
+                            "$cond": [
+                                {"$lte": ["$source_node_id", "$target_node_id"]},
+                                "$source_node_id",
+                                "$target_node_id",
+                            ]
+                        },
+                        "hi": {
+                            "$cond": [
+                                {"$lte": ["$source_node_id", "$target_node_id"]},
+                                "$target_node_id",
+                                "$source_node_id",
+                            ]
+                        },
+                    },
+                    "docs": {
+                        "$push": {
+                            "_id": "$_id",
+                            "source_id": "$source_id",
+                            "source_ids": "$source_ids",
+                            "file_path": "$file_path",
+                            "description": "$description",
+                            "keywords": "$keywords",
+                            "weight": "$weight",
+                            "created_at": "$created_at",
+                        }
+                    },
+                    "count": {"$sum": 1},
+                }
+            },
+            {"$match": {"count": {"$gt": 1}}},
+        ]
+        removed = 0
+        next_progress = _EDGE_MIGRATION_PROGRESS_INTERVAL
+        cursor = await self.edge_collection.aggregate(pipeline, allowDiskUse=True)
+        async for group in cursor:
+            docs = group["docs"]
+            survivor = max(docs, key=lambda d: d.get("created_at") or 0)
+            others = [d for d in docs if d["_id"] != survivor["_id"]]
+            if not others:
+                continue
+
+            # Merge the full relation payload across ALL docs (survivor included).
+            # The union fields (source_ids/file_path/description/keywords) union
+            # their split components, so re-merging an already-merged survivor (a
+            # fail-fast retry) is a no-op.
+            all_source_ids: list[str] = []
+            all_file_paths: list[str] = []
+            all_descriptions: list[str] = []
+            all_keywords: set[str] = set()
+            for d in docs:
+                all_source_ids = merge_source_ids(
+                    all_source_ids, _edge_source_id_list(d)
+                )
+                fp = d.get("file_path")
+                all_file_paths = merge_source_ids(
+                    all_file_paths, fp.split(GRAPH_FIELD_SEP) if fp else []
+                )
+                desc = d.get("description")
+                all_descriptions = merge_source_ids(
+                    all_descriptions, desc.split(GRAPH_FIELD_SEP) if desc else []
+                )
+                kw = d.get("keywords")
+                if kw:
+                    all_keywords.update(k.strip() for k in kw.split(",") if k.strip())
+
+            # Weight is summed like _merge_edges_then_upsert (duplicate docs carry
+            # separate accumulated evidence), but idempotently: the survivor's
+            # current weight is the base (counted once) and each other duplicate
+            # adds its weight ONLY if its source_ids are not already folded into
+            # the survivor. On a fail-fast retry the survivor already contains the
+            # others' source_ids, so they are skipped and the sum stays stable.
+            # Legacy string weights are coerced; non-numeric values are skipped so
+            # the migration cannot crash on a bad value.
+            survivor_sids = set(_edge_source_id_list(survivor))
+            weights: list[float] = []
+            sw = _coerce_weight(survivor.get("weight"))
+            if sw is not None:
+                weights.append(sw)
+            for o in others:
+                o_sids = set(_edge_source_id_list(o))
+                if not o_sids or o_sids <= survivor_sids:
+                    continue  # no new trackable evidence -> don't (re-)add weight
+                ow = _coerce_weight(o.get("weight"))
+                if ow is not None:
+                    weights.append(ow)
+
+            set_fields: dict[str, Any] = {}
+            if all_source_ids:
+                set_fields["source_ids"] = all_source_ids
+                set_fields["source_id"] = GRAPH_FIELD_SEP.join(all_source_ids)
+            if all_file_paths:
+                set_fields["file_path"] = GRAPH_FIELD_SEP.join(all_file_paths)
+            if all_descriptions:
+                set_fields["description"] = GRAPH_FIELD_SEP.join(all_descriptions)
+            if all_keywords:
+                set_fields["keywords"] = ",".join(sorted(all_keywords))
+            if weights:
+                set_fields["weight"] = sum(weights)
+            if set_fields:
+                await self.edge_collection.update_one(
+                    {"_id": survivor["_id"]}, {"$set": set_fields}
+                )
+            await self.edge_collection.delete_many(
+                {"_id": {"$in": [d["_id"] for d in others]}}
+            )
+            removed += len(others)
+            if removed >= next_progress:
+                logger.info(
+                    f"[{self.workspace}] Canonical edge migration progress: "
+                    f"deduped {removed} duplicate doc(s) so far"
+                )
+                next_progress += _EDGE_MIGRATION_PROGRESS_INTERVAL
+        return removed
+
+    async def _backfill_edge_endpoints(self) -> int:
+        """Set the canonical ``edge_lo``/``edge_hi`` on every doc that lacks them.
+
+        Returns the modified count. Runs after dedupe, so each canonical pair has
+        one doc and the backfilled (edge_lo, edge_hi) pairs are unique.
+        """
+        is_sorted = {"$lte": ["$source_node_id", "$target_node_id"]}
+        result = await self.edge_collection.update_many(
+            {"edge_lo": {"$exists": False}},
+            [
+                {
+                    "$set": {
+                        "edge_lo": {
+                            "$cond": [
+                                is_sorted,
+                                "$source_node_id",
+                                "$target_node_id",
+                            ]
+                        },
+                        "edge_hi": {
+                            "$cond": [
+                                is_sorted,
+                                "$target_node_id",
+                                "$source_node_id",
+                            ]
+                        },
+                    }
+                }
+            ],
+        )
+        return result.modified_count
+
+    # Sample entity document
+    # "source_ids" is Array representation of "source_id" split by GRAPH_FIELD_SEP
+
+    # {
+    #     "_id" : "CompanyA",
+    #     "entity_id" : "CompanyA",
+    #     "entity_type" : "Organization",
+    #     "description" : "A major technology company",
+    #     "source_id" : "chunk-eeec0036b909839e8ec4fa150c939eec",
+    #     "source_ids": ["chunk-eeec0036b909839e8ec4fa150c939eec"],
+    #     "file_path" : "custom_kg",
+    #     "created_at" : 1749904575
+    # }
+
+    # Sample relation document
+    # {
+    #     "_id" : ObjectId("6856ac6e7c6bad9b5470b678"), // MongoDB build-in ObjectId
+    #     "description" : "CompanyA develops ProductX",
+    #     "source_node_id" : "CompanyA",
+    #     "target_node_id" : "ProductX",
+    #     "relationship": "Develops", // To distinguish multiple same-target relations
+    #     "weight" : Double("1"),
+    #     "keywords" : "develop, produce",
+    #     "source_id" : "chunk-eeec0036b909839e8ec4fa150c939eec",
+    #     "source_ids": ["chunk-eeec0036b909839e8ec4fa150c939eec"],
+    #     "file_path" : "custom_kg",
+    #     "created_at" : 1749904575
+    # }
+
+    #
+    # -------------------------------------------------------------------------
+    # BASIC QUERIES
+    # -------------------------------------------------------------------------
+    #
+
+    async def has_node(self, node_id: str) -> bool:
+        """
+        Check if node_id is present in the collection by looking up its doc.
+        No real need for $graphLookup here, but let's keep it direct.
+        """
+        doc = await self.collection.find_one({"_id": node_id}, {"_id": 1})
+        return doc is not None
+
+    async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
+        """
+        Check if there's a direct single-hop edge between source_node_id and target_node_id.
+
+        Matches on the canonical ``(edge_lo, edge_hi)`` pair (direction-independent)
+        instead of the bidirectional ``$or``, so this point lookup is served by the
+        compound unique index. Safe because the fail-fast migration in
+        ``initialize`` guarantees every served doc carries the endpoints.
+        """
+        edge_lo, edge_hi = _canonical_edge_endpoints(source_node_id, target_node_id)
+        doc = await self.edge_collection.find_one(
+            {"edge_lo": edge_lo, "edge_hi": edge_hi},
+            {"_id": 1},
+        )
+        return doc is not None
+
+    #
+    # -------------------------------------------------------------------------
+    # DEGREES
+    # -------------------------------------------------------------------------
+    #
+
+    async def node_degree(self, node_id: str) -> int:
+        """
+        Returns the total number of edges connected to node_id (both inbound and outbound).
+        """
+        return await self.edge_collection.count_documents(
+            {"$or": [{"source_node_id": node_id}, {"target_node_id": node_id}]}
+        )
+
+    async def edge_degree(self, src_id: str, tgt_id: str) -> int:
+        """Get the total degree (sum of relationships) of two nodes.
+
+        Args:
+            src_id: Label of the source node
+            tgt_id: Label of the target node
+
+        Returns:
+            int: Sum of the degrees of both nodes
+        """
+        src_degree = await self.node_degree(src_id)
+        trg_degree = await self.node_degree(tgt_id)
+
+        return src_degree + trg_degree
+
+    #
+    # -------------------------------------------------------------------------
+    # GETTERS
+    # -------------------------------------------------------------------------
+    #
+
+    async def get_node(self, node_id: str) -> dict[str, str] | None:
+        """
+        Return the node properties, or None if missing.
+
+        The Mongo-managed ``_id`` (which holds the entity name) is stripped so
+        the returned dict carries only node properties, matching the contract
+        honored by the other backends. Leaving it in lets callers that re-upsert
+        a fetched node (e.g. entity rename) push ``_id`` into ``$set``, which
+        MongoDB rejects as a modification of the immutable ``_id``.
+        """
+        doc = await self.collection.find_one({"_id": node_id})
+        if doc is not None:
+            doc.pop("_id", None)
+        return doc
+
+    async def get_edge(
+        self, source_node_id: str, target_node_id: str
+    ) -> dict[str, str] | None:
+        # Canonical (edge_lo, edge_hi) point lookup served by the compound unique
+        # index (see has_edge); the fail-fast migration guarantees the endpoints.
+        edge_lo, edge_hi = _canonical_edge_endpoints(source_node_id, target_node_id)
+        doc = await self.edge_collection.find_one(
+            {"edge_lo": edge_lo, "edge_hi": edge_hi}
+        )
+        if doc is not None:
+            # Strip the Mongo-managed ``_id`` so re-upserting a fetched edge
+            # (e.g. relation rewrite during entity rename) cannot push ``_id``
+            # into ``$set`` and trip the immutable-field error.
+            doc.pop("_id", None)
+        return doc
+
+    async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
+        """
+        Retrieves all edges (relationships) for a particular node identified by its label.
+
+        Args:
+            source_node_id: Label of the node to get edges for
+
+        Returns:
+            list[tuple[str, str]]: List of (source_label, target_label) tuples representing edges
+            None: If the node does not exist
+
+        An existing node with no relations returns ``[]``, NOT ``None`` — the
+        BaseGraphStorage contract, as implemented by NetworkXStorage. No in-tree
+        caller reads the distinction today (they all guard with ``if edges:``),
+        so this restores the declared contract rather than fixing a live caller;
+        collapsing the two here is what makes the information unrecoverable for
+        a caller that needs it. A backend error is neither value: it propagates.
+        """
+        # Existence is decided by the node collection, before the edge scan —
+        # never inferred from the edges. upsert_edge / upsert_edges_batch now
+        # materialize both endpoints, so a dangling target should not arise from
+        # new writes, but rows written before that change still can carry one,
+        # and a read contract must not rest on a write-path invariant anyway.
+        # Inferring existence from the edge scan would make this method
+        # contradict has_node() on the same id, and delete_entity 404s on
+        # has_node(). Checking first also means an absent node costs one indexed
+        # point lookup instead of a full edge scan.
+        if not await self.has_node(source_node_id):
+            return None
+
+        cursor = self.edge_collection.find(
+            {
+                "$or": [
+                    {"source_node_id": source_node_id},
+                    {"target_node_id": source_node_id},
+                ]
+            },
+            {"source_node_id": 1, "target_node_id": 1},
+        )
+
+        return [
+            (e.get("source_node_id"), e.get("target_node_id")) async for e in cursor
+        ]
+
+    async def get_nodes_batch(self, node_ids: list[str]) -> dict[str, dict]:
+        result = {}
+
+        async for doc in self.collection.find({"_id": {"$in": node_ids}}):
+            node_id = doc.pop("_id")
+            result[node_id] = doc
+        return result
+
+    async def node_degrees_batch(self, node_ids: list[str]) -> dict[str, int]:
+        # merge the outbound and inbound results with the same "_id" and sum the "degree"
+        merged_results = {}
+
+        # Outbound degrees
+        outbound_pipeline = [
+            {"$match": {"source_node_id": {"$in": node_ids}}},
+            {"$group": {"_id": "$source_node_id", "degree": {"$sum": 1}}},
+        ]
+
+        cursor = await self.edge_collection.aggregate(
+            outbound_pipeline, allowDiskUse=True
+        )
+        async for doc in cursor:
+            merged_results[doc.get("_id")] = doc.get("degree")
+
+        # Inbound degrees
+        inbound_pipeline = [
+            {"$match": {"target_node_id": {"$in": node_ids}}},
+            {"$group": {"_id": "$target_node_id", "degree": {"$sum": 1}}},
+        ]
+
+        cursor = await self.edge_collection.aggregate(
+            inbound_pipeline, allowDiskUse=True
+        )
+        async for doc in cursor:
+            merged_results[doc.get("_id")] = merged_results.get(
+                doc.get("_id"), 0
+            ) + doc.get("degree")
+
+        return merged_results
+
+    async def get_nodes_edges_batch(
+        self, node_ids: list[str]
+    ) -> dict[str, list[tuple[str, str]]]:
+        """
+        Batch retrieve edges for multiple nodes.
+        For each node, returns both outgoing and incoming edges to properly represent
+        the undirected graph nature.
+
+        Args:
+            node_ids: List of node IDs (entity_id) for which to retrieve edges.
+
+        Returns:
+            A dictionary mapping each node ID to its list of edge tuples (source, target).
+            For each node, the list includes both:
+            - Outgoing edges: (queried_node, connected_node)
+            - Incoming edges: (connected_node, queried_node)
+        """
+        result = {node_id: [] for node_id in node_ids}
+
+        # Query outgoing edges (where node is the source)
+        outgoing_cursor = self.edge_collection.find(
+            {"source_node_id": {"$in": node_ids}},
+            {"source_node_id": 1, "target_node_id": 1},
+        )
+        async for edge in outgoing_cursor:
+            source = edge["source_node_id"]
+            target = edge["target_node_id"]
+            result[source].append((source, target))
+
+        # Query incoming edges (where node is the target)
+        incoming_cursor = self.edge_collection.find(
+            {"target_node_id": {"$in": node_ids}},
+            {"source_node_id": 1, "target_node_id": 1},
+        )
+        async for edge in incoming_cursor:
+            source = edge["source_node_id"]
+            target = edge["target_node_id"]
+            result[target].append((source, target))
+
+        return result
+
+    #
+    # -------------------------------------------------------------------------
+    # UPSERTS
+    # -------------------------------------------------------------------------
+    #
+
+    # MongoDB owns ``_id``: it is the node/edge document key and this class uses
+    # it as the update *filter*, so a caller-supplied ``_id`` in the attribute
+    # mapping is never an attribute -- it is an attempt to move the document.
+    # No legacy exposure: ``get_node`` / ``get_edge`` already strip ``_id`` for
+    # exactly this reason, so a rewrite never carries it back in.
+    # (``source_node_id`` / ``target_node_id`` / ``edge_lo`` / ``edge_hi`` need no
+    # entry here: ``upsert_edge`` assigns them *after* spreading the caller's
+    # mapping, so a supplied value is discarded by construction.)
+    _RESERVED_ATTRIBUTE_NAMES = frozenset({"_id"})
+
+    def _validate_attribute_names(self, attributes: dict, *, context: str) -> None:
+        """Reject attribute names MongoDB would interpret rather than store.
+
+        Attribute names reach the server inside a ``$set`` document, where they
+        are *field paths*: a dot addresses a subfield, so ``{"source_ids.0": x}``
+        rewrites the first element of the chunk-attribution array instead of
+        creating a field called ``source_ids.0``, and a leading ``$`` is read as
+        an update operator. Unlike the value rules, this hazard is specific to
+        this backend -- see ``validate_interpreted_attribute_names``.
+
+        Characters are deliberately not checked: MongoDB stores a name holding a
+        control character just fine, so rejecting one here would be a rule wider
+        than this backend's hazard. That character rule belongs to the
+        GraphML-backed store, which genuinely cannot serialize such a name.
+
+        Safe against pre-existing data despite rewrite paths spreading stored
+        attributes back into the payload: the two refused shapes cannot come
+        *out* of this collection. A legacy ``{"a.b": v}`` was interpreted as a
+        path when it was written, so the document holds ``{"a": {"b": v}}`` and
+        ``get_node`` returns the key ``a``; a ``$``-prefixed name was refused by
+        the server outright. That is also why the rule stops at the
+        interpretation hazard -- a merely unusual name such as ``display-name``
+        *is* stored flat and does round-trip, so rejecting it would strand the
+        entity.
+        """
+        validate_interpreted_attribute_names(attributes, context=context)
+        reserved = sorted(self._RESERVED_ATTRIBUTE_NAMES.intersection(attributes))
+        if reserved:
+            raise ValueError(
+                f"{context}: attribute name(s) {', '.join(reserved)} are reserved "
+                "by MongoDB and cannot be set as graph attributes"
+            )
+
+    def _node_context(self, node_id: str) -> str:
+        """Error-message prefix identifying a node write."""
+        return f"[{self.workspace}] node `{node_id}`"
+
+    def _edge_context(self, source_node_id: str, target_node_id: str) -> str:
+        """Error-message prefix identifying an edge write."""
+        return f"[{self.workspace}] edge `{source_node_id}`~`{target_node_id}`"
+
+    async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
+        """
+        Insert or update a node document.
+        """
+        self._validate_attribute_names(node_data, context=self._node_context(node_id))
+        update_doc = {"$set": {**node_data}}
+        if node_data.get("source_id", ""):
+            update_doc["$set"]["source_ids"] = node_data["source_id"].split(
+                GRAPH_FIELD_SEP
+            )
+
+        await self.collection.update_one({"_id": node_id}, update_doc, upsert=True)
+
+    async def upsert_edge(
+        self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]
+    ) -> None:
+        """Upsert the undirected edge between source_node_id and target_node_id.
+
+        Matches on the canonical ``(edge_lo, edge_hi)`` endpoint pair
+        (direction-independent) instead of the old bidirectional ``$or`` filter,
+        so the compound unique index can reject a racing duplicate insert. If two
+        writers race the first insert, the loser hits a ``DuplicateKeyError``; we
+        retry once, which now matches the just-inserted doc and updates it.
+        """
+        # Materialize BOTH endpoints, not just the source. A target-only
+        # endpoint would otherwise carry edges with no node document, and that
+        # dangling state is externally visible: has_node() says absent while the
+        # edge scan says connected, get_popular_labels ranks an id get_node
+        # returns nothing for, and delete_entity 404s on an entity whose edges
+        # are right there. NetworkXStorage.add_edge and PGOpsGraphStorage both
+        # create both ends; this makes the document backends agree.
+        #
+        # One bulk_write instead of two round trips, and $setOnInsert (the form
+        # upsert_edges_batch already uses) so an endpoint that already carries
+        # real properties is never touched. dict.fromkeys collapses a self-loop.
+        # Snapshot before validating, and build the update from the snapshot
+        # below. The endpoint bulk_write awaits between the check and the use, so
+        # validating the caller's own mapping would leave a window in which a
+        # caller that retains it could add a field path such as ``source_ids.0``
+        # after the check. (This also subsumes the "copy so we never mutate the
+        # caller's dict" reason the copy below already existed for.)
+        edge_attributes = dict(edge_data)
+        self._validate_attribute_names(
+            edge_attributes, context=self._edge_context(source_node_id, target_node_id)
+        )
+        await self.collection.bulk_write(
+            [
+                UpdateOne({"_id": nid}, {"$setOnInsert": {"_id": nid}}, upsert=True)
+                for nid in dict.fromkeys((source_node_id, target_node_id))
+            ],
+            ordered=False,
+        )
+
+        edge_lo, edge_hi = _canonical_edge_endpoints(source_node_id, target_node_id)
+
+        set_doc: dict = dict(edge_attributes)
+        if edge_attributes.get("source_id", ""):
+            set_doc["source_ids"] = edge_attributes["source_id"].split(GRAPH_FIELD_SEP)
+        set_doc["source_node_id"] = source_node_id
+        set_doc["target_node_id"] = target_node_id
+        set_doc["edge_lo"] = edge_lo
+        set_doc["edge_hi"] = edge_hi
+        update_doc = {"$set": set_doc}
+
+        for attempt in range(2):
+            try:
+                await self.edge_collection.update_one(
+                    {"edge_lo": edge_lo, "edge_hi": edge_hi}, update_doc, upsert=True
+                )
+                return
+            except DuplicateKeyError:
+                # Another writer inserted this edge between our filter miss and
+                # insert. Retry once: the doc now exists, so the upsert becomes a
+                # plain update. A second failure is unexpected — let it surface.
+                if attempt == 1:
+                    raise
+
+    async def upsert_nodes_batch(self, nodes: list[tuple[str, dict[str, str]]]) -> None:
+        """Batch insert/update multiple nodes using a single bulk_write() call.
+
+        Args:
+            nodes: List of (node_id, node_data) tuples.
+        """
+        if not nodes:
+            return
+        ops: list[tuple[Any, int, str]] = []
+        for node_id, node_data in nodes:
+            self._validate_attribute_names(
+                node_data, context=self._node_context(node_id)
+            )
+            update_doc: dict = {"$set": {**node_data}}
+            if node_data.get("source_id", ""):
+                update_doc["$set"]["source_ids"] = node_data["source_id"].split(
+                    GRAPH_FIELD_SEP
+                )
+            ops.append(
+                (
+                    UpdateOne({"_id": node_id}, update_doc, upsert=True),
+                    _estimate_doc_bytes(update_doc),
+                    node_id,
+                )
+            )
+        await _run_batched_bulk_write(
+            self.collection,
+            ops,
+            max_payload_bytes=self._max_upsert_payload_bytes,
+            max_records_per_batch=self._max_upsert_records_per_batch,
+            ordered=True,
+            log_prefix=f"[{self.workspace}] {self.namespace} nodes:",
+            what="node upsert",
+        )
+
+    async def has_nodes_batch(self, node_ids: list[str]) -> set[str]:
+        """Check existence of multiple nodes using a single $in query.
+
+        Args:
+            node_ids: List of node IDs to check.
+
+        Returns:
+            Set of node_ids that exist in the graph.
+        """
+        if not node_ids:
+            return set()
+        cursor = self.collection.find({"_id": {"$in": node_ids}}, {"_id": 1})
+        return {doc["_id"] async for doc in cursor}
+
+    async def upsert_edges_batch(
+        self, edges: list[tuple[str, str, dict[str, str]]]
+    ) -> None:
+        """Batch insert/update multiple edges using a single bulk_write() call.
+
+        Also ensures BOTH endpoints of every edge exist (matching upsert_edge()
+        behaviour) via a separate bulk_write on the node collection for any
+        endpoint that needs to be created as an empty placeholder.
+
+        Args:
+            edges: List of (source_node_id, target_node_id, edge_data) tuples.
+        """
+        if not edges:
+            return
+
+        # Whole batch first: the endpoint-placeholder bulk_write below happens
+        # before any edge document is written, so rejecting mid-loop would leave
+        # placeholder nodes behind for edges that were never created.
+        #
+        # Snapshot each mapping as it is validated and use the snapshots for the
+        # documents built after the placeholder await -- see upsert_edge for the
+        # window that closes.
+        validated_edges: list[tuple[str, str, dict]] = []
+        for src, tgt, edge_data in edges:
+            edge_attributes = dict(edge_data)
+            self._validate_attribute_names(
+                edge_attributes, context=self._edge_context(src, tgt)
+            )
+            validated_edges.append((src, tgt, edge_attributes))
+
+        # Both endpoints, not just the source — see upsert_edge for why a
+        # target-only endpoint is externally visible as an inconsistency.
+        endpoint_ids = list(
+            dict.fromkeys(
+                node_id for src, tgt, _data in edges for node_id in (src, tgt)
+            )
+        )
+        node_ops: list[tuple[Any, int, str]] = [
+            (
+                UpdateOne({"_id": nid}, {"$setOnInsert": {"_id": nid}}, upsert=True),
+                _estimate_doc_bytes({"_id": nid}),
+                nid,
+            )
+            for nid in endpoint_ids
+        ]
+        await _run_batched_bulk_write(
+            self.collection,
+            node_ops,
+            max_payload_bytes=self._max_upsert_payload_bytes,
+            max_records_per_batch=self._max_upsert_records_per_batch,
+            ordered=False,
+            log_prefix=f"[{self.workspace}] {self.namespace} edges:",
+            what="edge endpoint placeholder upsert",
+        )
+
+        # Key every edge by its canonical (edge_lo, edge_hi) pair and dedupe
+        # within the batch (last-write-wins). Deduping collapses reciprocal
+        # directions onto one op, which both matches the compound unique index
+        # and avoids an intra-batch duplicate-key error from two ops inserting
+        # the same endpoint pair.
+        deduped_ops: dict[tuple[str, str], tuple[Any, int, str]] = {}
+        for source_node_id, target_node_id, edge_attributes in validated_edges:
+            update_doc: dict = {"$set": dict(edge_attributes)}
+            if edge_attributes.get("source_id", ""):
+                update_doc["$set"]["source_ids"] = edge_attributes["source_id"].split(
+                    GRAPH_FIELD_SEP
+                )
+            update_doc["$set"]["source_node_id"] = source_node_id
+            update_doc["$set"]["target_node_id"] = target_node_id
+            edge_lo, edge_hi = _canonical_edge_endpoints(source_node_id, target_node_id)
+            update_doc["$set"]["edge_lo"] = edge_lo
+            update_doc["$set"]["edge_hi"] = edge_hi
+            deduped_ops[(edge_lo, edge_hi)] = (
+                UpdateOne(
+                    {"edge_lo": edge_lo, "edge_hi": edge_hi}, update_doc, upsert=True
+                ),
+                _estimate_doc_bytes(update_doc),
+                f"{source_node_id}->{target_node_id}",
+            )
+        edge_ops = list(deduped_ops.values())
+
+        # ordered=True (kept from the pre-canonical behaviour). Intra-batch
+        # last-write-wins is already guaranteed by the endpoint-pair dedupe above
+        # (one op per pair), so ordering is not load-bearing for that; we keep it
+        # for continuity. If a concurrent writer (another process bypassing the keyed
+        # lock) wins an insert, our upsert hits 11000 and the bulk aborts; we
+        # retry the whole op list once — the racing docs now exist, so the
+        # upserts update instead of inserting (idempotent). A non-11000 / write-
+        # concern error re-raises rather than being masked.
+        async def _run_edge_bulk() -> None:
+            await _run_batched_bulk_write(
+                self.edge_collection,
+                edge_ops,
+                max_payload_bytes=self._max_upsert_payload_bytes,
+                max_records_per_batch=self._max_upsert_records_per_batch,
+                ordered=True,
+                log_prefix=f"[{self.workspace}] {self.namespace} edges:",
+                what="edge upsert",
+            )
+
+        try:
+            await _run_edge_bulk()
+        except BulkWriteError as e:
+            details = e.details or {}
+            write_errors = details.get("writeErrors", [])
+            # Retry ONLY when every failure is a duplicate-key race; a
+            # writeConcern failure (durability problem, empty writeErrors) or any
+            # other write error must surface, not be masked by a blind retry.
+            #
+            # NOTE: under ordered=True the bulk aborts at the FIRST failing op, so
+            # writeErrors holds at most one entry — the all(...) check therefore
+            # only inspects that first error, not the whole batch. Ops after it
+            # never ran; they re-run when we retry the entire op list below. So a
+            # non-11000 error hidden behind a leading 11000 is not masked — it
+            # simply surfaces one retry later (the retry hits it and re-raises,
+            # since by then the leading dup has resolved to a plain update).
+            dup_only = (
+                bool(write_errors)
+                and all(we.get("code") == _DUPLICATE_KEY_CODE for we in write_errors)
+                and not details.get("writeConcernErrors")
+            )
+            if not dup_only:
+                raise
+            logger.debug(
+                f"[{self.workspace}] {self.namespace} edges: {len(write_errors)} "
+                f"duplicate-key race(s) on edge upsert; retrying as updates"
+            )
+            await _run_edge_bulk()
+
+    #
+    # -------------------------------------------------------------------------
+    # DELETION
+    # -------------------------------------------------------------------------
+    #
+
+    async def delete_node(self, node_id: str) -> None:
+        """
+        1) Remove node's doc entirely.
+        2) Remove inbound & outbound edges from any doc that references node_id.
+        """
+        # Remove all edges
+        await self.edge_collection.delete_many(
+            {"$or": [{"source_node_id": node_id}, {"target_node_id": node_id}]}
+        )
+
+        # Remove the node doc
+        await self.collection.delete_one({"_id": node_id})
+
+    #
+    # -------------------------------------------------------------------------
+    # QUERY
+    # -------------------------------------------------------------------------
+    #
+
+    async def get_all_labels(self) -> list[str]:
+        """
+        Get all existing node _ids(entity names) in the database
+        Returns:
+            [id1, id2, ...]  # Alphabetically sorted id list
+        """
+
+        # Use aggregation with allowDiskUse for large datasets
+        pipeline = [{"$project": {"_id": 1}}, {"$sort": {"_id": 1}}]
+        cursor = await self.collection.aggregate(pipeline, allowDiskUse=True)
+        labels = []
+        async for doc in cursor:
+            labels.append(doc["_id"])
+        return labels
+
+    def _construct_graph_node(
+        self, node_id, node_data: dict[str, str]
+    ) -> KnowledgeGraphNode:
+        return KnowledgeGraphNode(
+            id=node_id,
+            labels=[node_id],
+            properties={
+                k: v
+                for k, v in node_data.items()
+                if k
+                not in [
+                    "_id",
+                    "connected_edges",
+                    "source_ids",
+                    "edge_count",
+                ]
+            },
+        )
+
+    def _construct_graph_edge(self, edge_id: str, edge: dict[str, str]):
+        return KnowledgeGraphEdge(
+            id=edge_id,
+            type=edge.get("relationship", ""),
+            source=edge["source_node_id"],
+            target=edge["target_node_id"],
+            properties={
+                k: v
+                for k, v in edge.items()
+                if k
+                not in [
+                    "_id",
+                    "source_node_id",
+                    "target_node_id",
+                    "relationship",
+                    "source_ids",
+                    "edge_lo",
+                    "edge_hi",
+                ]
+            },
+        )
+
+    async def _fetch_nodes_by_ids(
+        self, node_ids: list[str], projection: dict[str, int] | None = None
+    ) -> list[dict[str, Any]]:
+        """Fetch nodes by ID while preserving the requested order."""
+        if not node_ids:
+            return []
+
+        cursor = self.collection.find({"_id": {"$in": node_ids}}, projection)
+        docs_by_id = {}
+        async for doc in cursor:
+            docs_by_id[str(doc["_id"])] = doc
+        return [docs_by_id[node_id] for node_id in node_ids if node_id in docs_by_id]
+
+    async def _rank_edge_endpoints_by_degree(
+        self, limit: int, skip: int = 0
+    ) -> list[str]:
+        """Rank edge endpoints by undirected degree, ties on the label ascending.
+
+        Paged rather than fetched whole because the ``$limit`` runs server-side:
+        the caller cannot tell how many of a page really have node documents
+        until it has fetched them, so it needs a way to ask for the next ones.
+        The sort is a TOTAL order -- degree descending, then the unique ``_id``
+        -- which is what makes ``$skip`` paging over it stable across passes.
+        """
+        if limit <= 0:
+            return []
+
+        pipeline: list[dict[str, Any]] = [
+            {"$project": {"source_node_id": 1, "_id": 0}},
+            {"$group": {"_id": "$source_node_id", "degree": {"$sum": 1}}},
+            {
+                "$unionWith": {
+                    "coll": self._edge_collection_name,
+                    "pipeline": [
+                        {"$project": {"target_node_id": 1, "_id": 0}},
+                        {
+                            "$group": {
+                                "_id": "$target_node_id",
+                                "degree": {"$sum": 1},
+                            }
+                        },
+                    ],
+                }
+            },
+            {"$group": {"_id": "$_id", "degree": {"$sum": "$degree"}}},
+            # Degree descending, then label ascending. The tie-break is the
+            # BaseGraphStorage contract: $limit cuts a band of equal-degree
+            # entities, and without a second sort key which ones survive is
+            # whatever order the aggregation happens to emit.
+            {"$sort": {"degree": -1, "_id": 1}},
+        ]
+        if skip:
+            pipeline.append({"$skip": skip})
+        pipeline.append({"$limit": limit})
+
+        cursor = await self.edge_collection.aggregate(pipeline, allowDiskUse=True)
+        return [str(doc["_id"]) async for doc in cursor]
+
+    async def _accept_existing_nodes(
+        self,
+        candidate_ids: list[str],
+        limit: int,
+        result: KnowledgeGraph,
+        accepted: list[str],
+    ) -> None:
+        """Append the candidates that really have node documents, up to `limit`.
+
+        ``_fetch_nodes_by_ids`` preserves the requested order and drops ids with
+        no document, so consuming it in order preserves the ranking and never
+        lets an id that resolves to nothing occupy a slot.
+
+        Asks for the current shortfall first and for the remainder only if that
+        did not fill it, so at most two queries: the caller passes whole ranked
+        pages, and filling the handful of slots a few dangling ids vacated must
+        not pull a page of node documents to place a few nodes.
+        """
+        if not candidate_ids or len(accepted) >= limit:
+            return
+
+        head = candidate_ids[: limit - len(accepted)]
+        for chunk in (head, candidate_ids[len(head) :]):
+            if not chunk or len(accepted) >= limit:
+                break
+            docs = await self._fetch_nodes_by_ids(chunk, {"source_ids": 0})
+            for doc in docs:
+                if len(accepted) >= limit:
+                    break
+                accepted.append(str(doc["_id"]))
+                result.nodes.append(self._construct_graph_node(doc["_id"], doc))
+
+    async def get_knowledge_graph_all_by_degree(
+        self, max_depth: int, max_nodes: int
+    ) -> KnowledgeGraph:
+        """
+        It's possible that the node with one or multiple relationships is retrieved,
+        while its neighbor is not.  Then this node might seem like disconnected in UI.
+        """
+
+        total_node_count = await self.collection.count_documents({})
+        result = KnowledgeGraph()
+        seen_edges = set()
+
+        result.is_truncated = total_node_count > max_nodes
+        if result.is_truncated:
+            # The ranked ids are edge ENDPOINTS, and upsert_edge only guarantees
+            # the source node exists, so one can be a dangling id with no node
+            # document -- a legacy state this backend deliberately tolerates
+            # (see the traversal, which counts only documents it actually read).
+            # Taking the $limit as final let such an id consume a slot and the
+            # answer came back short, reachable as soon as ties break on the
+            # label because a dangling label sorts like any other.
+            # Page the band until the cap fills or the band runs out, so a
+            # vacated slot always goes to the next-ranked entry. The loop is
+            # what keeps the top-up below meaning what it says: it is reachable
+            # only once every edge-backed entity has been offered a slot, so
+            # everything it can still pick really is degree-0. Stopping earlier
+            # would let an isolate outrank an entity further down the band --
+            # only ONE dangling id in this page plus one in the next is enough
+            # to reach that, so it is not a corner.
+            #
+            # Whole pages, not shortfall-sized ones: a page is {_id, degree}
+            # rows, cheap next to the aggregation that produces it, so each
+            # extra pass should make as much progress as it can. The document
+            # fetch inside _accept_existing_nodes stays shortfall-sized.
+            node_ids: list[str] = []
+            skip = 0
+            while len(node_ids) < max_nodes:
+                ranked_page = await self._rank_edge_endpoints_by_degree(
+                    max_nodes, skip=skip
+                )
+                skip += len(ranked_page)
+                await self._accept_existing_nodes(
+                    ranked_page, max_nodes, result, node_ids
+                )
+                if len(ranked_page) < max_nodes:
+                    break  # short page: the band is exhausted
+
+            if len(node_ids) < max_nodes:
+                # Top up from the isolated (degree-0) entities, in label order
+                # for the same reason the ranking above breaks ties on the
+                # label: an unordered `find` handed the shortfall to whichever
+                # documents the collection scan reached first. These come from
+                # the node collection, so they exist by construction and are
+                # appended directly. list(node_ids), not node_ids: the cursor is
+                # consumed while appending to the same list, and a live
+                # reference makes the $nin filter depend on when it serializes.
+                remaining = max_nodes - len(node_ids)
+                cursor = (
+                    self.collection.find(
+                        {"_id": {"$nin": list(node_ids)}},
+                        {"source_ids": 0},
+                    )
+                    .sort("_id", 1)
+                    .limit(remaining)
+                )
+                async for doc in cursor:
+                    node_ids.append(str(doc["_id"]))
+                    result.nodes.append(self._construct_graph_node(doc["_id"], doc))
+
+            # As node count reaches the limit, only need to fetch the edges that
+            # directly connect to these nodes. Filtered on the RESOLVED ids: a
+            # dangling endpoint left in here would surface an edge pointing at a
+            # node the response does not contain.
+            edge_cursor = self.edge_collection.find(
+                {
+                    "$and": [
+                        {"source_node_id": {"$in": node_ids}},
+                        {"target_node_id": {"$in": node_ids}},
+                    ]
+                }
+            )
+        else:
+            # All nodes and edges are needed
+            cursor = self.collection.find({}, {"source_ids": 0})
+
+            async for doc in cursor:
+                result.nodes.append(self._construct_graph_node(doc["_id"], doc))
+
+            edge_cursor = self.edge_collection.find({})
+
+        async for edge in edge_cursor:
+            edge_id = f"{edge['source_node_id']}-{edge['target_node_id']}"
+            if edge_id not in seen_edges:
+                seen_edges.add(edge_id)
+                result.edges.append(self._construct_graph_edge(edge_id, edge))
+
+        return result
+
+    async def _bidirectional_bfs_nodes(
+        self,
+        node_labels: list[str],
+        seen_nodes: set[str],
+        result: KnowledgeGraph,
+        depth: int,
+        max_depth: int,
+        max_nodes: int,
+    ) -> KnowledgeGraph:
+        if depth > max_depth:
+            return result
+
+        # Project away source_ids: ranking materialises the WHOLE level before
+        # the cap can discard any of it (the pre-ranking loop could stop at the
+        # first node past max_nodes), and source_ids is the one unbounded field
+        # on the document. The wildcard path feeds _construct_graph_node from a
+        # {"source_ids": 0} cursor already, so it is provably not needed here.
+        cursor = self.collection.find({"_id": {"$in": node_labels}}, {"source_ids": 0})
+
+        # node_labels can name the same node twice (reached by two edges of the
+        # previous level); a duplicate reaching the admission loop would spend a
+        # second slot and trip the cap on a node that is not new.
+        level_nodes = []
+        level_seen = set()
+        async for node in cursor:
+            node_id = node["_id"]
+            if node_id in seen_nodes or node_id in level_seen:
+                continue
+            level_seen.add(node_id)
+            level_nodes.append(node)
+
+        # find() answers in natural order, not $in order, so an overflowing
+        # level needs the contract's ranking before the cap reads it. Only an
+        # overflowing level pays: a level that fits is admitted whole, and the
+        # contract binds which nodes survive, not their order.
+        if len(level_nodes) > 1 and len(result.nodes) + len(level_nodes) > max_nodes:
+            level_degrees = await self.node_degrees_batch(
+                [
+                    node["_id"]
+                    for node in level_nodes[:_GRAPH_DEGREE_RANK_MAX_CANDIDATES]
+                ]
+            )
+            level_nodes.sort(
+                key=lambda node: (-level_degrees.get(node["_id"], 0), node["_id"])
+            )
+
+        for node in level_nodes:
+            node_id = node["_id"]
+            if len(result.nodes) >= max_nodes:
+                result.is_truncated = True
+                return result
+            seen_nodes.add(node_id)
+            result.nodes.append(self._construct_graph_node(node_id, node))
+
+        # Collect neighbors
+        # Get both inbound and outbound one hop nodes
+        cursor = self.edge_collection.find(
+            {
+                "$or": [
+                    {"source_node_id": {"$in": node_labels}},
+                    {"target_node_id": {"$in": node_labels}},
+                ]
+            }
+        )
+
+        neighbor_nodes = []
+        async for edge in cursor:
+            if edge["source_node_id"] not in seen_nodes:
+                neighbor_nodes.append(edge["source_node_id"])
+            if edge["target_node_id"] not in seen_nodes:
+                neighbor_nodes.append(edge["target_node_id"])
+
+        if neighbor_nodes:
+            result = await self._bidirectional_bfs_nodes(
+                neighbor_nodes, seen_nodes, result, depth + 1, max_depth, max_nodes
+            )
+
+        return result
+
+    async def get_knowledge_subgraph_bidirectional_bfs(
+        self,
+        node_label: str,
+        depth: int,
+        max_depth: int,
+        max_nodes: int,
+    ) -> KnowledgeGraph:
+        seen_nodes = set()
+        seen_edges = set()
+        result = KnowledgeGraph()
+
+        result = await self._bidirectional_bfs_nodes(
+            [node_label], seen_nodes, result, depth, max_depth, max_nodes
+        )
+
+        # Get all edges from seen_nodes
+        all_node_ids = list(seen_nodes)
+        cursor = self.edge_collection.find(
+            {
+                "$and": [
+                    {"source_node_id": {"$in": all_node_ids}},
+                    {"target_node_id": {"$in": all_node_ids}},
+                ]
+            }
+        )
+
+        async for edge in cursor:
+            edge_id = f"{edge['source_node_id']}-{edge['target_node_id']}"
+            if edge_id not in seen_edges:
+                result.edges.append(self._construct_graph_edge(edge_id, edge))
+                seen_edges.add(edge_id)
+
+        return result
+
+    async def get_knowledge_subgraph_in_out_bound_bfs(
+        self, node_label: str, max_depth: int, max_nodes: int
+    ) -> KnowledgeGraph:
+        seen_nodes = set()
+        seen_edges = set()
+        result = KnowledgeGraph()
+        project_doc = {
+            "source_ids": 0,
+            "created_at": 0,
+            "entity_type": 0,
+            "file_path": 0,
+        }
+
+        # Verify if starting node exists
+        start_node = await self.collection.find_one({"_id": node_label})
+        if not start_node:
+            logger.warning(
+                f"[{self.workspace}] Starting node with label {node_label} does not exist!"
+            )
+            return result
+
+        seen_nodes.add(node_label)
+        result.nodes.append(self._construct_graph_node(node_label, start_node))
+
+        if max_depth == 0:
+            return result
+
+        # In MongoDB, depth = 0 means one-hop
+        max_depth = max_depth - 1
+
+        pipeline = [
+            {"$match": {"_id": node_label}},
+            {"$project": project_doc},
+            {
+                "$graphLookup": {
+                    "from": self._edge_collection_name,
+                    "startWith": "$_id",
+                    "connectFromField": "target_node_id",
+                    "connectToField": "source_node_id",
+                    "maxDepth": max_depth,
+                    "depthField": "depth",
+                    "as": "connected_edges",
+                },
+            },
+            {
+                "$unionWith": {
+                    "coll": self._collection_name,
+                    "pipeline": [
+                        {"$match": {"_id": node_label}},
+                        {"$project": project_doc},
+                        {
+                            "$graphLookup": {
+                                "from": self._edge_collection_name,
+                                "startWith": "$_id",
+                                "connectFromField": "source_node_id",
+                                "connectToField": "target_node_id",
+                                "maxDepth": max_depth,
+                                "depthField": "depth",
+                                "as": "connected_edges",
+                            }
+                        },
+                    ],
+                }
+            },
+        ]
+
+        cursor = await self.collection.aggregate(pipeline, allowDiskUse=True)
+        node_edges = []
+
+        # Two records for node_label are returned capturing outbound and inbound connected_edges
+        async for doc in cursor:
+            if doc.get("connected_edges", []):
+                node_edges.extend(doc.get("connected_edges"))
+
+        # Sort the connected edges by depth ascending and weight descending
+        # And stores the source_node_id and target_node_id in sequence to retrieve the neighbouring nodes
+        node_edges = sorted(
+            node_edges,
+            key=lambda x: (x["depth"], -x["weight"]),
+        )
+
+        # Dedupe edge endpoints (excluding the start node) preserving the
+        # existing depth/weight priority order.
+        ordered_candidates = []
+        seen_candidates = set()
+        for edge in node_edges:
+            for candidate in (edge["source_node_id"], edge["target_node_id"]):
+                if candidate != node_label and candidate not in seen_candidates:
+                    seen_candidates.add(candidate)
+                    ordered_candidates.append(candidate)
+
+        # Candidates are raw edge endpoints: upsert_edge only guarantees the
+        # source node exists, not the target, so some candidates may be
+        # dangling (no node document). Resolve real existence in priority
+        # order, in bounded batches, stopping once max_nodes real candidates
+        # are confirmed -- the start node already occupies one of the
+        # max_nodes slots, so only the first max_nodes - 1 real ids end up in
+        # the result, and finding a max_nodes-th real candidate proves
+        # truncation without having to probe the entire reachable set.
+        real_ids = []
+        batch_size = max(max_nodes, 1)
+        for i in range(0, len(ordered_candidates), batch_size):
+            if len(real_ids) >= max_nodes:
+                break
+            batch = ordered_candidates[i : i + batch_size]
+            found_cursor = self.collection.find({"_id": {"$in": batch}}, {"_id": 1})
+            found_ids = {doc["_id"] async for doc in found_cursor}
+            for candidate in batch:
+                if candidate in found_ids:
+                    real_ids.append(candidate)
+                    if len(real_ids) >= max_nodes:
+                        break
+
+        result.is_truncated = len(real_ids) >= max_nodes
+        node_ids = real_ids[: max_nodes - 1]
+        seen_nodes.update(node_ids)
+
+        cursor = self.collection.find({"_id": {"$in": node_ids}})
+
+        async for doc in cursor:
+            result.nodes.append(self._construct_graph_node(str(doc["_id"]), doc))
+
+        for edge in node_edges:
+            if (
+                edge["source_node_id"] not in seen_nodes
+                or edge["target_node_id"] not in seen_nodes
+            ):
+                continue
+
+            edge_id = f"{edge['source_node_id']}-{edge['target_node_id']}"
+            if edge_id not in seen_edges:
+                result.edges.append(self._construct_graph_edge(edge_id, edge))
+                seen_edges.add(edge_id)
+
+        return result
+
+    async def get_knowledge_graph(
+        self,
+        node_label: str,
+        max_depth: int = 3,
+        max_nodes: int = None,
+    ) -> KnowledgeGraph:
+        """
+        Retrieve a connected subgraph of nodes where the label includes the specified `node_label`.
+
+        Args:
+            node_label: Label of the starting node, * means all nodes
+            max_depth: Maximum depth of the subgraph, Defaults to 3
+            max_nodes: Maximum nodes to return, Defaults to global_config max_graph_nodes
+
+        Returns:
+            KnowledgeGraph object containing nodes and edges, with an is_truncated flag
+            indicating whether the graph was truncated due to max_nodes limit
+
+        If a graph is like this and starting from B:
+        A → B ← C ← F, B -> E, C → D
+
+        Outbound BFS:
+        B → E
+
+        Inbound BFS:
+        A → B
+        C → B
+        F → C
+
+        Bidirectional BFS:
+        A → B
+        B → E
+        F → C
+        C → B
+        C → D
+        """
+        # Use global_config max_graph_nodes as default if max_nodes is None
+        if max_nodes is None:
+            max_nodes = self.global_config.get("max_graph_nodes", 1000)
+        else:
+            # Limit max_nodes to not exceed global_config max_graph_nodes
+            max_nodes = min(max_nodes, self.global_config.get("max_graph_nodes", 1000))
+
+        result = KnowledgeGraph()
+        start = time.perf_counter()
+
+        try:
+            # Optimize pipeline to avoid memory issues with large datasets
+            if node_label == "*":
+                result = await self.get_knowledge_graph_all_by_degree(
+                    max_depth, max_nodes
+                )
+            elif GRAPH_BFS_MODE == "in_out_bound":
+                result = await self.get_knowledge_subgraph_in_out_bound_bfs(
+                    node_label, max_depth, max_nodes
+                )
+            else:
+                result = await self.get_knowledge_subgraph_bidirectional_bfs(
+                    node_label, 0, max_depth, max_nodes
+                )
+
+            duration = time.perf_counter() - start
+
+            logger.info(
+                f"[{self.workspace}] Subgraph query successful in {duration:.4f} seconds | Node count: {len(result.nodes)} | Edge count: {len(result.edges)} | Truncated: {result.is_truncated}"
+            )
+
+        except PyMongoError as e:
+            # Handle memory limit errors specifically
+            if "memory limit" in str(e).lower() or "sort exceeded" in str(e).lower():
+                logger.warning(
+                    f"[{self.workspace}] MongoDB memory limit exceeded, falling back to simple query: {str(e)}"
+                )
+                # Fallback to a simple query without complex aggregation
+                try:
+                    simple_cursor = self.collection.find({}).limit(max_nodes)
+                    async for doc in simple_cursor:
+                        result.nodes.append(
+                            self._construct_graph_node(str(doc["_id"]), doc)
+                        )
+                    result.is_truncated = True
+                    logger.info(
+                        f"[{self.workspace}] Fallback query completed | Node count: {len(result.nodes)}"
+                    )
+                except PyMongoError as fallback_error:
+                    logger.error(
+                        f"[{self.workspace}] Fallback query also failed: {str(fallback_error)}"
+                    )
+            else:
+                logger.error(f"[{self.workspace}] MongoDB query failed: {str(e)}")
+
+        return result
+
+    async def index_done_callback(self) -> None:
+        # Mongo handles persistence automatically
+        pass
+
+    async def remove_nodes(self, nodes: list[str]) -> None:
+        """Delete multiple nodes
+
+        Args:
+            nodes: List of node IDs to be deleted
+        """
+        logger.info(f"[{self.workspace}] Deleting {len(nodes)} nodes")
+        if not nodes:
+            return
+
+        # 1. Remove all edges referencing these nodes
+        await self.edge_collection.delete_many(
+            {
+                "$or": [
+                    {"source_node_id": {"$in": nodes}},
+                    {"target_node_id": {"$in": nodes}},
+                ]
+            }
+        )
+
+        # 2. Delete the node documents
+        await self.collection.delete_many({"_id": {"$in": nodes}})
+
+        logger.debug(f"[{self.workspace}] Successfully deleted nodes: {nodes}")
+
+    async def remove_edges(self, edges: list[tuple[str, str]]) -> None:
+        """Delete multiple edges
+
+        Args:
+            edges: List of edges to be deleted, each edge is a (source, target) tuple
+        """
+        logger.info(f"[{self.workspace}] Deleting {len(edges)} edges")
+        if not edges:
+            return
+
+        # Match each edge by its canonical (edge_lo, edge_hi) pair: one clause per
+        # edge (vs. the old two-clause bidirectional pair) served by the compound
+        # unique index, with reciprocal/duplicate inputs collapsed. Safe because
+        # the fail-fast migration guarantees every served doc carries the endpoints.
+        seen: set[tuple[str, str]] = set()
+        all_edge_pairs = []
+        for source_id, target_id in edges:
+            endpoints = _canonical_edge_endpoints(source_id, target_id)
+            if endpoints in seen:
+                continue
+            seen.add(endpoints)
+            all_edge_pairs.append({"edge_lo": endpoints[0], "edge_hi": endpoints[1]})
+
+        # Chunk the $or by record count so a large delete stays under the bulk
+        # message / 16MB query limit; endpoints are bounded id strings, so a count
+        # cap is enough (no byte budget needed). A non-positive cap disables it.
+        chunk = (
+            self._max_delete_records_per_batch
+            if self._max_delete_records_per_batch > 0
+            else len(all_edge_pairs)
+        )
+        for i in range(0, len(all_edge_pairs), chunk):
+            await self.edge_collection.delete_many(
+                {"$or": all_edge_pairs[i : i + chunk]}
+            )
+
+        logger.debug(f"[{self.workspace}] Successfully deleted edges: {edges}")
+
+    async def get_all_nodes(self) -> list[dict]:
+        """Get all nodes in the graph.
+
+        Returns:
+            A list of all nodes, where each node is a dictionary of its properties
+        """
+        cursor = self.collection.find({})
+        nodes = []
+        async for node in cursor:
+            node_dict = dict(node)
+            # Add node id (entity_id) to the dictionary for easier access
+            node_dict["id"] = node_dict.get("_id")
+            nodes.append(node_dict)
+        return nodes
+
+    async def get_all_edges(self) -> list[dict]:
+        """Get all edges in the graph.
+
+        Returns:
+            A list of all edges, where each edge is a dictionary of its properties
+        """
+        cursor = self.edge_collection.find({})
+        edges = []
+        async for edge in cursor:
+            edge_dict = dict(edge)
+            edge_dict["source"] = edge_dict.get("source_node_id")
+            edge_dict["target"] = edge_dict.get("target_node_id")
+            edges.append(edge_dict)
+        return edges
+
+    async def get_popular_labels(self, limit: int = 300) -> list[str]:
+        """Get popular labels(entity names) by node degree (most connected entities)
+
+        Args:
+            limit: Maximum number of labels to return
+
+        Returns:
+            List of labels(entity names) sorted by degree (highest first)
+
+        Two phases, and the second one usually does not run. Phase 1 ranks the
+        entities that HAVE edges, straight off the edge collection — the cheap
+        aggregation, and on any graph with more than ``limit`` connected
+        entities it fills every slot on its own. Only when it comes up short
+        does phase 2 top the result up from the isolated (degree-0) entities,
+        which is exactly the case the edge-only ranking got wrong by returning
+        nothing at all for a graph whose entities carry no relations.
+
+        Giving every node a degree-0 baseline row inside the aggregation instead
+        would be simpler, but it forces a full pass over the node collection on
+        every call — on a large graph, to produce a result phase 1 already had.
+        """
+        try:
+            # Self-loops count twice (the source and target groups each see the
+            # document), matching the other backends.
+            pipeline = [
+                # Count outbound edges
+                {"$group": {"_id": "$source_node_id", "out_degree": {"$sum": 1}}},
+                # Union with inbound edges count
+                {
+                    "$unionWith": {
+                        "coll": self._edge_collection_name,
+                        "pipeline": [
+                            {
+                                "$group": {
+                                    "_id": "$target_node_id",
+                                    "in_degree": {"$sum": 1},
+                                }
+                            }
+                        ],
+                    }
+                },
+                # Group by node_id and sum degrees
+                {
+                    "$group": {
+                        "_id": "$_id",
+                        "total_degree": {
+                            "$sum": {
+                                "$add": [
+                                    {"$ifNull": ["$out_degree", 0]},
+                                    {"$ifNull": ["$in_degree", 0]},
+                                ]
+                            }
+                        },
+                    }
+                },
+                # Sort by degree descending, then by label ascending
+                {"$sort": {"total_degree": -1, "_id": 1}},
+                # Limit results
+                {"$limit": limit},
+                # Project only the label
+                {"$project": {"_id": 1}},
+            ]
+
+            cursor = await self.edge_collection.aggregate(pipeline, allowDiskUse=True)
+            labels = []
+            async for doc in cursor:
+                if doc.get("_id"):
+                    labels.append(doc["_id"])
+
+            if len(labels) < limit:
+                # Phase 1 returned fewer than `limit`, and its aggregation is
+                # exact, so the connected set is now known in full: every node
+                # outside it has no edge at all. Top up in label order, bounded
+                # by the shortfall — the sort rides the _id index, so this stops
+                # as soon as it has enough rather than scanning the collection.
+                # list(labels), not labels: the cursor is consumed below while
+                # appending to the same list, and handing the driver a live
+                # reference makes the filter depend on when it serializes.
+                isolated_cursor = (
+                    self.collection.find({"_id": {"$nin": list(labels)}}, {"_id": 1})
+                    .sort("_id", 1)
+                    .limit(limit - len(labels))
+                )
+                async for doc in isolated_cursor:
+                    if doc.get("_id"):
+                        labels.append(doc["_id"])
+
+            logger.debug(
+                f"[{self.workspace}] Retrieved {len(labels)} popular labels (limit: {limit})"
+            )
+            return labels
+        except Exception as e:
+            # Raise, never return []: an empty list here is indistinguishable
+            # from "the graph has no entities". /graph/label/popular already
+            # turns an exception into a 500, so swallowing it handed the WebUI a
+            # 200 with an empty entity picker while the database was down.
+            logger.error(f"[{self.workspace}] Error getting popular labels: {str(e)}")
+            raise
+
+    async def _try_atlas_text_search(self, query_strip: str, limit: int) -> list[str]:
+        """Try Atlas Search using simple text search."""
+        try:
+            pipeline = [
+                {
+                    "$search": {
+                        "index": "entity_id_search_idx",
+                        "text": {"query": query_strip, "path": "_id"},
+                    }
+                },
+                {"$project": {"_id": 1, "score": {"$meta": "searchScore"}}},
+                {"$limit": limit},
+            ]
+            cursor = await self.collection.aggregate(pipeline)
+            labels = [doc["_id"] async for doc in cursor if doc.get("_id")]
+            if labels:
+                logger.debug(
+                    f"[{self.workspace}] Atlas text search returned {len(labels)} results"
+                )
+                return labels
+            return []
+        except PyMongoError as e:
+            logger.debug(f"[{self.workspace}] Atlas text search failed: {e}")
+            return []
+
+    async def _try_atlas_autocomplete_search(
+        self, query_strip: str, limit: int
+    ) -> list[str]:
+        """Try Atlas Search using autocomplete for prefix matching."""
+        try:
+            pipeline = [
+                {
+                    "$search": {
+                        "index": "entity_id_search_idx",
+                        "autocomplete": {
+                            "query": query_strip,
+                            "path": "_id",
+                            "fuzzy": {"maxEdits": 1, "prefixLength": 1},
+                        },
+                    }
+                },
+                {"$project": {"_id": 1, "score": {"$meta": "searchScore"}}},
+                {"$limit": limit},
+            ]
+            cursor = await self.collection.aggregate(pipeline)
+            labels = [doc["_id"] async for doc in cursor if doc.get("_id")]
+            if labels:
+                logger.debug(
+                    f"[{self.workspace}] Atlas autocomplete search returned {len(labels)} results"
+                )
+                return labels
+            return []
+        except PyMongoError as e:
+            logger.debug(f"[{self.workspace}] Atlas autocomplete search failed: {e}")
+            return []
+
+    async def _try_atlas_compound_search(
+        self, query_strip: str, limit: int
+    ) -> list[str]:
+        """Try Atlas Search using compound query for comprehensive matching."""
+        try:
+            pipeline = [
+                {
+                    "$search": {
+                        "index": "entity_id_search_idx",
+                        "compound": {
+                            "should": [
+                                {
+                                    "text": {
+                                        "query": query_strip,
+                                        "path": "_id",
+                                        "score": {"boost": {"value": 10}},
+                                    }
+                                },
+                                {
+                                    "autocomplete": {
+                                        "query": query_strip,
+                                        "path": "_id",
+                                        "score": {"boost": {"value": 5}},
+                                        "fuzzy": {"maxEdits": 1, "prefixLength": 1},
+                                    }
+                                },
+                                {
+                                    "wildcard": {
+                                        "query": f"*{query_strip}*",
+                                        "path": "_id",
+                                        "score": {"boost": {"value": 2}},
+                                    }
+                                },
+                            ],
+                            "minimumShouldMatch": 1,
+                        },
+                    }
+                },
+                {"$project": {"_id": 1, "score": {"$meta": "searchScore"}}},
+                {"$sort": {"score": {"$meta": "searchScore"}}},
+                {"$limit": limit},
+            ]
+            cursor = await self.collection.aggregate(pipeline)
+            labels = [doc["_id"] async for doc in cursor if doc.get("_id")]
+            if labels:
+                logger.debug(
+                    f"[{self.workspace}] Atlas compound search returned {len(labels)} results"
+                )
+                return labels
+            return []
+        except PyMongoError as e:
+            logger.debug(f"[{self.workspace}] Atlas compound search failed: {e}")
+            return []
+
+    async def _fallback_regex_search(self, query_strip: str, limit: int) -> list[str]:
+        """Fallback to regex-based search when Atlas Search fails."""
+        try:
+            logger.debug(
+                f"[{self.workspace}] Using regex fallback search for: '{query_strip}'"
+            )
+
+            escaped_query = re.escape(query_strip)
+            regex_condition = {"_id": {"$regex": escaped_query, "$options": "i"}}
+            cursor = self.collection.find(regex_condition, {"_id": 1}).limit(limit * 2)
+            docs = await cursor.to_list(length=limit * 2)
+
+            # Extract labels
+            labels = []
+            for doc in docs:
+                doc_id = doc.get("_id")
+                if doc_id:
+                    labels.append(doc_id)
+
+            # Sort results to prioritize exact matches and starts-with matches
+            def sort_key(label):
+                label_lower = label.lower()
+                query_lower_strip = query_strip.lower()
+
+                if label_lower == query_lower_strip:
+                    return (0, label_lower)  # Exact match - highest priority
+                elif label_lower.startswith(query_lower_strip):
+                    return (1, label_lower)  # Starts with - medium priority
+                else:
+                    return (2, label_lower)  # Contains - lowest priority
+
+            labels.sort(key=sort_key)
+            labels = labels[:limit]  # Apply final limit after sorting
+
+            logger.debug(
+                f"[{self.workspace}] Regex fallback search returned {len(labels)} results (limit: {limit})"
+            )
+            return labels
+
+        except Exception as e:
+            # Last resort in the progressive chain: the Atlas methods are allowed
+            # to fail (they may simply be unavailable) and fall through to here,
+            # but if the regex scan itself fails the search produced no answer at
+            # all. Returning [] would report that as "nothing matched".
+            logger.error(f"[{self.workspace}] Regex fallback search failed: {e}")
+            import traceback
+
+            logger.error(f"[{self.workspace}] Traceback: {traceback.format_exc()}")
+            raise
+
+    async def search_labels(self, query: str, limit: int = 50) -> list[str]:
+        """
+        Search labels(entity names) with progressive fallback strategy:
+        1. Atlas text search (simple and fast)
+        2. Atlas autocomplete search (prefix matching with fuzzy)
+        3. Atlas compound search (comprehensive matching)
+        4. Regex fallback (when Atlas Search is unavailable)
+        """
+        query_strip = query.strip()
+        if not query_strip:
+            return []
+
+        # First check if we have any nodes at all
+        try:
+            node_count = await self.collection.count_documents({})
+            if node_count == 0:
+                logger.debug(
+                    f"[{self.workspace}] No nodes found in collection {self._collection_name}"
+                )
+                return []
+        except PyMongoError as e:
+            # A failed count is not "the graph is empty" — that shortcut would
+            # report a transport blip as "no labels match".
+            logger.error(f"[{self.workspace}] Error counting nodes: {e}")
+            raise
+
+        # Progressive search strategy
+        search_methods = [
+            ("text", self._try_atlas_text_search),
+            ("autocomplete", self._try_atlas_autocomplete_search),
+            ("compound", self._try_atlas_compound_search),
+        ]
+
+        # Try Atlas Search methods in order
+        for method_name, search_method in search_methods:
+            try:
+                labels = await search_method(query_strip, limit)
+                if labels:
+                    logger.debug(
+                        f"[{self.workspace}] Search successful using {method_name} method: {len(labels)} results"
+                    )
+                    return labels
+                else:
+                    logger.debug(
+                        f"[{self.workspace}] {method_name} search returned no results, trying next method"
+                    )
+            except Exception as e:
+                logger.debug(
+                    f"[{self.workspace}] {method_name} search failed: {e}, trying next method"
+                )
+                continue
+
+        # If all Atlas Search methods fail, use regex fallback
+        logger.info(
+            f"[{self.workspace}] All Atlas Search methods failed, using regex fallback search for: '{query_strip}'"
+        )
+        return await self._fallback_regex_search(query_strip, limit)
+
+    async def _check_if_index_needs_rebuild(
+        self, indexes: list, index_name: str
+    ) -> bool:
+        """Check if the existing index needs to be rebuilt due to configuration issues."""
+        for index in indexes:
+            if index["name"] == index_name:
+                # Check if the index has the old problematic configuration
+                definition = index.get("latestDefinition", {})
+                mappings = definition.get("mappings", {})
+                fields = mappings.get("fields", {})
+                id_field = fields.get("_id", {})
+
+                # If it's the old single-type autocomplete configuration, rebuild
+                if (
+                    isinstance(id_field, dict)
+                    and id_field.get("type") == "autocomplete"
+                ):
+                    logger.info(
+                        f"[{self.workspace}] Found old index configuration for '{index_name}', will rebuild"
+                    )
+                    return True
+
+                # If it's not a list (multi-type configuration), rebuild
+                if not isinstance(id_field, list):
+                    logger.info(
+                        f"[{self.workspace}] Index '{index_name}' needs upgrade to multi-type configuration"
+                    )
+                    return True
+
+                logger.info(
+                    f"[{self.workspace}] Index '{index_name}' has correct configuration"
+                )
+                return False
+        return True  # Index doesn't exist, needs creation
+
+    async def _safely_drop_old_index(self, index_name: str):
+        """Safely drop the old search index."""
+        try:
+            await self.collection.drop_search_index(index_name)
+            logger.info(
+                f"[{self.workspace}] Successfully dropped old search index '{index_name}'"
+            )
+        except PyMongoError as e:
+            logger.warning(
+                f"[{self.workspace}] Could not drop old index '{index_name}': {e}"
+            )
+
+    async def _create_improved_search_index(self, index_name: str):
+        """Create an improved search index with multiple field types."""
+        search_index_model = SearchIndexModel(
+            definition={
+                "mappings": {
+                    "dynamic": False,
+                    "fields": {
+                        "_id": [
+                            {
+                                "type": "string",
+                            },
+                            {
+                                "type": "token",
+                            },
+                            {
+                                "type": "autocomplete",
+                                "maxGrams": 15,
+                                "minGrams": 2,
+                            },
+                        ]
+                    },
+                },
+                "analyzer": "lucene.standard",  # Index-level analyzer for text processing
+            },
+            name=index_name,
+            type="search",
+        )
+
+        await self.collection.create_search_index(search_index_model)
+        logger.info(
+            f"[{self.workspace}] Created improved Atlas Search index '{index_name}' for collection {self._collection_name}. "
+        )
+        logger.info(
+            f"[{self.workspace}] Index will be built asynchronously, using regex fallback until ready."
+        )
+
+    async def create_search_index_if_not_exists(self):
+        """Creates an improved Atlas Search index for entity search, rebuilding if necessary."""
+        index_name = "entity_id_search_idx"
+
+        try:
+            # Check if we're using MongoDB Atlas (has search index capabilities)
+            indexes_cursor = await self.collection.list_search_indexes()
+            indexes = await indexes_cursor.to_list(length=None)
+
+            # Check if we need to rebuild the index
+            needs_rebuild = await self._check_if_index_needs_rebuild(
+                indexes, index_name
+            )
+
+            if needs_rebuild:
+                # Check if index exists and drop it
+                index_exists = any(idx["name"] == index_name for idx in indexes)
+                if index_exists:
+                    await self._safely_drop_old_index(index_name)
+
+                # Create the improved search index (async, no waiting)
+                await self._create_improved_search_index(index_name)
+            else:
+                logger.info(
+                    f"[{self.workspace}] Atlas Search index '{index_name}' already exists with correct configuration"
+                )
+
+        except PyMongoError as e:
+            # This is expected if not using MongoDB Atlas or if search indexes are not supported
+            logger.info(
+                f"[{self.workspace}] Could not create Atlas Search index for {self._collection_name}: {e}. "
+                "This is normal if not using MongoDB Atlas - search will use regex fallback."
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{self.workspace}] Unexpected error creating Atlas Search index for {self._collection_name}: {e}"
+            )
+
+    async def drop(self) -> dict[str, str]:
+        """Drop the storage by removing all documents in the collection.
+
+        Returns:
+            dict[str, str]: Status of the operation with keys 'status' and 'message'
+        """
+        try:
+            result = await self.collection.delete_many({})
+            deleted_count = result.deleted_count
+
+            logger.info(
+                f"[{self.workspace}] Dropped {deleted_count} documents from graph {self._collection_name}"
+            )
+
+            result = await self.edge_collection.delete_many({})
+            edge_count = result.deleted_count
+            logger.info(
+                f"[{self.workspace}] Dropped {edge_count} edges from graph {self._edge_collection_name}"
+            )
+
+            return {
+                "status": "success",
+                "message": f"{deleted_count} documents and {edge_count} edges dropped",
+            }
+        except PyMongoError as e:
+            logger.error(
+                f"[{self.workspace}] Error dropping graph {self._collection_name}: {e}"
+            )
+            return {"status": "error", "message": str(e)}
+
+
+@dataclass
+class _PendingVectorDoc:
+    """Buffered vector upsert waiting for embedding and/or bulk flush."""
+
+    source: dict[str, Any]
+    content: str
+    vector: list[float] | None = None
+
+
+@final
+@dataclass
+class MongoVectorDBStorage(BaseVectorStorage):
+    db: AsyncDatabase | None = field(default=None)
+    _data: AsyncCollection | None = field(default=None)
+    _index_name: str = field(default="", init=False)
+
+    def __init__(
+        self, namespace, global_config, embedding_func, workspace=None, meta_fields=None
+    ):
+        super().__init__(
+            namespace=namespace,
+            workspace=workspace or "",
+            global_config=global_config,
+            embedding_func=embedding_func,
+            meta_fields=meta_fields or set(),
+        )
+        self.__post_init__()
+
+    def __post_init__(self):
+        validate_workspace(self.workspace)
+        self._validate_embedding_func()
+
+        # Check for MONGODB_WORKSPACE environment variable first (higher priority)
+        # This allows administrators to force a specific workspace for all MongoDB storage instances
+        mongodb_workspace = os.environ.get("MONGODB_WORKSPACE")
+        if mongodb_workspace and mongodb_workspace.strip():
+            # Use environment variable value, overriding the passed workspace parameter
+            effective_workspace = mongodb_workspace.strip()
+            logger.info(
+                f"Using MONGODB_WORKSPACE environment variable: '{effective_workspace}' (overriding '{self.workspace}/{self.namespace}')"
+            )
+        else:
+            # Use the workspace parameter passed during initialization
+            effective_workspace = self.workspace
+            if effective_workspace:
+                logger.debug(
+                    f"Using passed workspace parameter: '{effective_workspace}'"
+                )
+
+        # Build final_namespace with workspace prefix for data isolation
+        # Keep original namespace unchanged for type detection logic
+        if effective_workspace:
+            self.final_namespace = f"{effective_workspace}_{self.namespace}"
+            self.workspace = effective_workspace
+            logger.debug(
+                f"Final namespace with workspace prefix: '{self.final_namespace}'"
+            )
+        else:
+            # When workspace is empty, final_namespace equals original namespace
+            self.final_namespace = self.namespace
+            self.workspace = ""
+            logger.debug(f"Final namespace (no workspace): '{self.final_namespace}'")
+
+        # Set index name based on workspace for backward compatibility
+        if effective_workspace:
+            # Use collection-specific index name for workspaced collections to avoid conflicts
+            self._index_name = f"vector_knn_index_{self.final_namespace}"
+        else:
+            # Keep original index name for backward compatibility with existing deployments
+            self._index_name = "vector_knn_index"
+
+        kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
+        cosine_threshold = kwargs.get("cosine_better_than_threshold")
+        if cosine_threshold is None:
+            raise ValueError(
+                "cosine_better_than_threshold must be specified in vector_db_storage_cls_kwargs"
+            )
+        self.cosine_better_than_threshold = cosine_threshold
+        self._collection_name = self.final_namespace
+        self._max_batch_size = self.global_config["embedding_batch_num"]
+
+        # Flush-time batching limits (see module-level DEFAULT_MONGO_* constants).
+        # A non-positive value disables that splitting dimension. The upsert and
+        # delete caps are shared across KV/graph/VDB via the _resolve_* helpers so
+        # every path stays under the same bulk message / 16MB query limit.
+        (
+            self._max_upsert_payload_bytes,
+            self._max_upsert_records_per_batch,
+        ) = _resolve_upsert_batch_limits()
+        self._max_delete_records_per_batch = _resolve_delete_batch_limit()
+
+        # Deferred-embedding buffers and the per-namespace flush lock.
+        # Constructed in initialize() once shared-storage primitives are
+        # available; keyed on final_namespace so two instances pointing at
+        # the same MongoDB collection (e.g. with the MONGODB_WORKSPACE env
+        # override) share a single writer lock.
+        self._pending_vector_docs: dict[str, _PendingVectorDoc] = {}
+        self._pending_vector_deletes: set[str] = set()
+        self._flush_lock = None
+
+    async def initialize(self):
+        async with get_data_init_lock():
+            if self.db is None:
+                self.db = await ClientManager.get_client()
+
+            self._data = await get_or_create_collection(self.db, self._collection_name)
+
+            # Ensure vector index exists
+            await self.create_vector_index_if_not_exists()
+
+            logger.debug(
+                f"[{self.workspace}] Use MongoDB as VDB {self._collection_name}"
+            )
+
+        if self._flush_lock is None:
+            self._flush_lock = get_namespace_lock(
+                namespace=self.final_namespace, workspace=""
+            )
+
+    async def finalize(self):
+        """Flush pending vector ops, release the Mongo client, surface unflushed data."""
+        flush_error: Exception | None = None
+        try:
+            await self._flush_pending_vector_ops()
+        except Exception as e:
+            flush_error = e
+
+        if self.db is not None:
+            await ClientManager.release_client(self.db)
+            self.db = None
+            self._data = None
+
+        pending_docs = len(self._pending_vector_docs)
+        pending_deletes = len(self._pending_vector_deletes)
+
+        if flush_error is not None:
+            raise RuntimeError(
+                f"[{self.workspace}] MongoVectorDBStorage.finalize() flush raised; "
+                f"{pending_docs} pending upserts and {pending_deletes} pending "
+                f"deletes were left buffered (client released, data lost)"
+            ) from flush_error
+        if pending_docs or pending_deletes:
+            raise RuntimeError(
+                f"[{self.workspace}] MongoVectorDBStorage.finalize() left "
+                f"{pending_docs} pending upserts and {pending_deletes} pending "
+                f"deletes buffered after final flush attempt (these writes have been lost)"
+            )
+
+    async def _wait_for_search_index_absent(
+        self, index_name: str, *, timeout: float = 120.0, interval: float = 2.0
+    ) -> None:
+        """Poll until a dropped search index disappears.
+
+        ``create_search_index`` rejects a name that still exists while the
+        prior drop is in the DELETING state, so a recreate must wait for the
+        old index to clear first. Best-effort: on timeout it logs and returns
+        so the subsequent create surfaces any genuine conflict itself rather
+        than blocking initialize() indefinitely.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            cursor = await self._data.list_search_indexes()
+            names = {idx["name"] for idx in await cursor.to_list(length=None)}
+            if index_name not in names:
+                return
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    f"[{self.workspace}] dropped search index {index_name} still "
+                    f"present after {timeout:.0f}s; proceeding to recreate"
+                )
+                return
+            await asyncio.sleep(interval)
+
+    async def create_vector_index_if_not_exists(self):
+        """Create the Atlas Vector Search index, repairing a FAILED one.
+
+        Atlas/mongot leaves a vector index in the terminal ``FAILED`` state
+        after a build error and never retries it on its own; when that index
+        is also non-queryable every subsequent ``$vectorSearch`` raises
+        ``cannot query vector index ... while in state FAILED``. Matching the
+        index only by name would treat that dead index as healthy and wedge
+        all queries permanently, so a non-queryable, same-dimension FAILED
+        index is dropped and rebuilt here.
+
+        Two guards run *before* the rebuild: (1) a FAILED index that is still
+        ``queryable`` (a background rebuild/update failed but the previously
+        built index keeps serving) is left in place to avoid taking a
+        still-serving index offline; (2) a FAILED index built under a
+        different embedding model raises rather than being auto-rebuilt
+        against incompatible stored vectors. Transitional states
+        (``PENDING``/``BUILDING``) are left alone -- they become queryable
+        without intervention.
+        """
+        try:
+            indexes_cursor = await self._data.list_search_indexes()
+            indexes = await indexes_cursor.to_list(length=None)
+            for index in indexes:
+                if index["name"] != self._index_name:
+                    continue
+
+                # Read the stored vector dimension first so the mismatch
+                # guard below runs even for a FAILED index. A FAILED index
+                # built under a *different* embedding model must NOT be
+                # silently auto-rebuilt: recreating with the new dimension
+                # against incompatible stored vectors would just FAIL again
+                # and hide the required data-directory reset from the
+                # operator. Only a same-dimension FAILED index is self-healed.
+                existing_dim = None
+                definition = index.get("latestDefinition", {})
+                fields = definition.get("fields", [])
+                for field in fields:
+                    if field.get("type") == "vector" and field.get("path") == "vector":
+                        existing_dim = field.get("numDimensions")
+                        break
+
+                expected_dim = self.embedding_func.embedding_dim
+
+                if existing_dim is not None and existing_dim != expected_dim:
+                    error_msg = (
+                        f"Vector dimension mismatch! Index '{self._index_name}' has "
+                        f"dimension {existing_dim}, but current embedding model expects "
+                        f"dimension {expected_dim}. Please drop the existing index or "
+                        f"use an embedding model with matching dimensions."
+                    )
+                    logger.error(f"[{self.workspace}] {error_msg}")
+                    raise ValueError(error_msg)
+
+                # Self-heal a FAILED index, but ONLY when it is actually
+                # non-queryable. Atlas can report status="FAILED" while
+                # queryable=true -- e.g. a background rebuild/update failed
+                # yet the previously-built index keeps serving queries (see
+                # the listSearchIndexes status docs). Dropping such an index
+                # here would take a still-serving index offline and cause
+                # avoidable query downtime while we wait for deletion and
+                # rebuild. Reached only once the dimension guard above
+                # confirmed the stored dimension matches.
+                if index.get("status") == "FAILED":
+                    if index.get("queryable", True):
+                        logger.warning(
+                            f"[{self.workspace}] vector index {self._index_name} reports "
+                            f"FAILED status but is still queryable; leaving the active "
+                            f"index in place. A background rebuild/update likely failed -- "
+                            f"inspect $listSearchIndexes statusDetail and drop/rebuild "
+                            f"manually if queries degrade."
+                        )
+                        return
+
+                    # Non-queryable FAILED build is terminal: drop and fall
+                    # through to recreate (the same self-heal `drop()` relies
+                    # on). Wait for the drop to clear first -- create_search_index
+                    # rejects a name that still exists while the old index is
+                    # DELETING.
+                    logger.warning(
+                        f"[{self.workspace}] vector index {self._index_name} is FAILED "
+                        f"and non-queryable; dropping and recreating it"
+                    )
+                    await self._data.drop_search_index(self._index_name)
+                    await self._wait_for_search_index_absent(self._index_name)
+                    break
+
+                logger.info(
+                    f"[{self.workspace}] vector index {self._index_name} already exists with matching dimensions ({expected_dim})"
+                )
+                return
+
+            search_index_model = SearchIndexModel(
+                definition={
+                    "fields": [
+                        {
+                            "type": "vector",
+                            "numDimensions": self.embedding_func.embedding_dim,  # Ensure correct dimensions
+                            "path": "vector",
+                            "similarity": "cosine",  # Options: euclidean, cosine, dotProduct
+                        }
+                    ]
+                },
+                name=self._index_name,
+                type="vectorSearch",
+            )
+
+            await self._data.create_search_index(search_index_model)
+            logger.info(
+                f"[{self.workspace}] Vector index {self._index_name} created successfully."
+            )
+
+        except PyMongoError as e:
+            error_msg = f"[{self.workspace}] Error creating vector index {self._index_name}: {e}"
+            logger.error(error_msg)
+            raise SystemExit(
+                f"Failed to create MongoDB vector index. Program cannot continue. {error_msg}"
+            )
+
+    async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        """Buffer vector docs for embedding and batched flush.
+
+        Embedding deliberately does NOT happen here: repeated upserts of
+        the same id, or many small batches, collapse into a single
+        flush-time embedding pass. Reads observe pending docs via the
+        same lock for read-your-writes.
+        """
+        if not data:
+            return
+
+        current_time = int(time.time())
+
+        pending_docs: list[tuple[str, _PendingVectorDoc]] = []
+        for i, (k, v) in enumerate(data.items(), start=1):
+            source = {
+                "_id": k,
+                "created_at": current_time,
+                **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
+            }
+            pending_docs.append(
+                (
+                    k,
+                    _PendingVectorDoc(source=source, content=v["content"]),
+                )
+            )
+            await _cooperative_yield(i)
+
+        # Installing a fresh _PendingVectorDoc invalidates any vector
+        # cached by a prior get_vectors_by_ids() call on a stale revision.
+        async with self._flush_lock:
+            for doc_id, pdoc in pending_docs:
+                self._pending_vector_deletes.discard(doc_id)
+                self._pending_vector_docs[doc_id] = pdoc
+
+    async def query(
+        self, query: str, top_k: int, query_embedding: list[float] = None
+    ) -> list[dict[str, Any]]:
+        """Queries the vector database using Atlas Vector Search.
+
+        Reads from the server-side index only; buffered upserts and deletes
+        are NOT visible until ``index_done_callback`` / ``finalize`` flushes
+        them. Callers that need read-your-writes for a freshly upserted id
+        should use ``get_by_id`` / ``get_by_ids`` (which consult the buffer)
+        or flush first. Matches the deferred-embedding contract used by
+        OpenSearch / FAISS / Nano.
+        """
+        if query_embedding is not None:
+            # Convert numpy array to list if needed for MongoDB compatibility
+            if hasattr(query_embedding, "tolist"):
+                query_vector = query_embedding.tolist()
+            else:
+                query_vector = list(query_embedding)
+        else:
+            # Generate the embedding
+            embedding = await self.embedding_func(
+                [query], context="query", _priority=DEFAULT_QUERY_PRIORITY
+            )  # higher priority for query
+            # Convert numpy array to a list to ensure compatibility with MongoDB
+            query_vector = embedding[0].tolist()
+
+        # Define the aggregation pipeline with the converted query vector
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": self._index_name,  # Use stored index name for consistency
+                    "path": "vector",
+                    "queryVector": query_vector,
+                    "numCandidates": 100,  # Adjust for performance
+                    "limit": top_k,
+                }
+            },
+            {"$addFields": {"score": {"$meta": "vectorSearchScore"}}},
+            {"$match": {"score": {"$gte": self.cosine_better_than_threshold}}},
+            {"$project": {"vector": 0}},
+        ]
+
+        # Execute the aggregation pipeline
+        cursor = await self._data.aggregate(pipeline, allowDiskUse=True)
+        results = await cursor.to_list(length=None)
+
+        # Format and return the results with created_at field
+        return [
+            {
+                **doc,
+                "id": doc["_id"],
+                "distance": doc.get("score", None),
+                "created_at": doc.get("created_at"),  # Include created_at field
+            }
+            for doc in results
+        ]
+
+    async def index_done_callback(self) -> None:
+        """Flush buffered vector ops; Mongo persists automatically once written."""
+        await self._flush_pending_vector_ops()
+
+    async def drop_pending_index_ops(self) -> None:
+        """Discard buffered upserts/deletes (pipeline aborting on error)."""
+        async with self._flush_lock:
+            self._pending_vector_docs.clear()
+            self._pending_vector_deletes.clear()
+
+    async def _flush_pending_vector_ops(self) -> None:
+        """Flush buffered vector upserts and deletes in batched bulk writes.
+
+        Embedding runs *inside* this lock (not in `upsert` or lock-free):
+        it makes deferred embedding and the bulk write atomic against
+        concurrent upserts and destructive mutations. Any failure (embed
+        or server write) raises and leaves both buffers intact; the next
+        `index_done_callback` retries automatically.
+
+        Concurrency invariant: ``_flush_lock`` is a non-reentrant asyncio
+        lock. Callers MUST NOT hold it when invoking this method --
+        re-entry would deadlock. The only in-tree callers are
+        ``index_done_callback`` and ``finalize``, both lock-free.
+        """
+        async with self._flush_lock:
+            if not self._pending_vector_docs and not self._pending_vector_deletes:
+                return
+            if self._data is None:
+                return
+
+            pending_docs = self._pending_vector_docs
+            pending_deletes = self._pending_vector_deletes
+
+            docs_to_embed: list[tuple[str, _PendingVectorDoc]] = [
+                (doc_id, pdoc)
+                for doc_id, pdoc in pending_docs.items()
+                if pdoc.vector is None
+            ]
+
+            if docs_to_embed:
+                contents = [pdoc.content for _, pdoc in docs_to_embed]
+                batches = [
+                    contents[i : i + self._max_batch_size]
+                    for i in range(0, len(contents), self._max_batch_size)
+                ]
+                logger.info(
+                    f"[{self.workspace}] {self.namespace} flush: embedding "
+                    f"{len(docs_to_embed)} vectors in {len(batches)} batch(es) "
+                    f"(batch_num={self._max_batch_size})"
+                )
+                try:
+                    embeddings_list = await asyncio.gather(
+                        *[
+                            self.embedding_func(batch, context="document")
+                            for batch in batches
+                        ]
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[{self.workspace}] Error embedding pending vector ops "
+                        f"(upserts={len(docs_to_embed)}): {e}"
+                    )
+                    raise
+
+                embeddings = np.concatenate(embeddings_list)
+                if len(embeddings) != len(docs_to_embed):
+                    raise RuntimeError(
+                        f"[{self.workspace}] Embedding count mismatch: expected "
+                        f"{len(docs_to_embed)}, got {len(embeddings)}"
+                    )
+                for i, ((_, pdoc), embedding) in enumerate(
+                    zip(docs_to_embed, embeddings), start=1
+                ):
+                    pdoc.vector = np.array(embedding, dtype=np.float32).tolist()
+                    await _cooperative_yield(i)
+
+            # Assemble final upsert payload. After the embed loop above every
+            # pending doc has a non-None vector (count-mismatch was checked),
+            # so we can iterate without re-guarding. Each full_doc carries its
+            # own "_id" (from source), matching the UpdateOne filter key.
+            ids_to_commit: list[str] = list(pending_docs.keys())
+            list_data: list[dict[str, Any]] = [
+                {**pending_docs[doc_id].source, "vector": pending_docs[doc_id].vector}
+                for doc_id in ids_to_commit
+            ]
+
+            try:
+                if list_data:
+                    # Split the upsert into batches that stay under the server-side
+                    # bulk-command message limit and bound peak memory. Fail-fast:
+                    # any batch failure raises immediately and the full buffer is
+                    # retained for the next flush (upsert/delete are idempotent).
+                    # Logging is kept aligned with MilvusVectorDBStorage; the
+                    # batching maths is shared via _chunk_by_budget.
+                    upsert_batches = _chunk_by_budget(
+                        list_data,
+                        _estimate_doc_bytes,
+                        self._max_upsert_payload_bytes,
+                        self._max_upsert_records_per_batch,
+                    )
+                    if len(upsert_batches) > 1:
+                        logger.info(
+                            f"[{self.workspace}] {self.namespace} flush: upsert split into "
+                            f"{len(upsert_batches)} batches for {len(list_data)} records "
+                            f"(max_payload={self._max_upsert_payload_bytes} batch={self._max_upsert_records_per_batch})"
+                        )
+                    for batch_index, (records_batch, estimated_bytes) in enumerate(
+                        upsert_batches, 1
+                    ):
+                        if (
+                            len(records_batch) == 1
+                            and self._max_upsert_payload_bytes > 0
+                            and estimated_bytes > self._max_upsert_payload_bytes
+                        ):
+                            logger.warning(
+                                f"[{self.workspace}] {self.namespace} flush: single record "
+                                f"id={records_batch[0].get('_id')} estimated {estimated_bytes} bytes "
+                                f"exceeds {self._max_upsert_payload_bytes}"
+                            )
+                        logger.debug(
+                            f"[{self.workspace}] MongoDB upsert batch {batch_index}/{len(upsert_batches)}: "
+                            f"records={len(records_batch)}, estimated_payload_bytes={estimated_bytes}"
+                        )
+                        await self._data.bulk_write(
+                            [
+                                UpdateOne(
+                                    {"_id": doc["_id"]}, {"$set": doc}, upsert=True
+                                )
+                                for doc in records_batch
+                            ],
+                            ordered=False,
+                        )
+                if pending_deletes:
+                    # Chunk deletes by record count; _ids are short strings so a
+                    # count cap is enough to stay under the bulk message limit.
+                    # delete_many($in) is the 1:1 equivalent of a batched delete.
+                    delete_ids = list(pending_deletes)
+                    delete_chunk = (
+                        self._max_delete_records_per_batch
+                        if self._max_delete_records_per_batch > 0
+                        else len(delete_ids)
+                    )
+                    for i in range(0, len(delete_ids), delete_chunk):
+                        await self._data.delete_many(
+                            {"_id": {"$in": delete_ids[i : i + delete_chunk]}}
+                        )
+            except Exception as e:
+                logger.error(
+                    f"[{self.workspace}] Error flushing vector ops "
+                    f"(upserts={len(pending_docs)}, "
+                    f"deletes={len(pending_deletes)}): {e}"
+                )
+                raise
+
+            # On success, clear the buffers in-place so external references
+            # (e.g. drop()) see the cleared state.
+            for doc_id in ids_to_commit:
+                pending_docs.pop(doc_id, None)
+            pending_deletes.clear()
+
+    async def delete(self, ids: list[str]) -> None:
+        """Buffer vector deletes for batched flush."""
+        if not ids:
+            return
+        if isinstance(ids, set):
+            ids = list(ids)
+        async with self._flush_lock:
+            for doc_id in ids:
+                self._pending_vector_docs.pop(doc_id, None)
+                self._pending_vector_deletes.add(doc_id)
+        logger.debug(
+            f"[{self.workspace}] Buffered delete for {len(ids)} vectors in {self.namespace}"
+        )
+
+    async def delete_entity(self, entity_name: str) -> None:
+        """Buffer an entity vector delete by computing its hash ID."""
+        entity_id = compute_mdhash_id(entity_name, prefix="ent-")
+        async with self._flush_lock:
+            self._pending_vector_docs.pop(entity_id, None)
+            self._pending_vector_deletes.add(entity_id)
+        logger.debug(
+            f"[{self.workspace}] Buffered delete for entity {entity_name} (id={entity_id})"
+        )
+
+    async def delete_entity_relation(self, entity_name: str) -> None:
+        """Delete all relation vectors where entity appears as src or tgt.
+
+        The whole method runs under ``_flush_lock`` so the server-side find
+        + delete cannot interleave with an in-flight bulk write. Server-side
+        failures are re-raised (no log-and-swallow): the caller decides
+        whether to retry.
+
+        Buffer semantics — post-prune with caller short-circuit contract:
+            Matching pending upserts in ``_pending_vector_docs`` are
+            pruned **only after** the server-side ``delete_many``
+            succeeds. On failure the pending buffer stays intact and
+            the exception propagates so the caller (``adelete_by_entity``
+            in ``utils_graph.py``) can short-circuit before
+            ``_persist_graph_updates`` flushes a half-cleaned buffer.
+        """
+
+        def _prune_pending() -> None:
+            for doc_id in [
+                k
+                for k, v in self._pending_vector_docs.items()
+                if v.source.get("src_id") == entity_name
+                or v.source.get("tgt_id") == entity_name
+            ]:
+                self._pending_vector_docs.pop(doc_id, None)
+
+        async with self._flush_lock:
+            if self._data is None:
+                # No server state to mutate; buffer prune is the only
+                # delete intent we can record.
+                _prune_pending()
+                return
+
+            # _id is the only field we need from the find; project to keep
+            # the cursor light.
+            relations_cursor = self._data.find(
+                {"$or": [{"src_id": entity_name}, {"tgt_id": entity_name}]},
+                {"_id": 1},
+            )
+            relations = await relations_cursor.to_list(length=None)
+
+            if not relations:
+                # No server rows to delete — still safe to prune any
+                # pending upserts so they can't re-create the relation.
+                _prune_pending()
+                logger.debug(
+                    f"[{self.workspace}] No relations found for entity {entity_name}"
+                )
+                return
+
+            relation_ids = [relation["_id"] for relation in relations]
+            await self._data.delete_many({"_id": {"$in": relation_ids}})
+            # Server-side delete succeeded — safe to prune the pending
+            # buffer so subsequent flushes don't re-upsert the deleted
+            # relations.
+            _prune_pending()
+            logger.debug(
+                f"[{self.workspace}] Deleted {len(relation_ids)} relations for {entity_name}"
+            )
+
+    async def get_by_id(self, id: str) -> dict[str, Any] | None:
+        """Get vector data by its ID, with read-your-writes against the buffer.
+
+        Pending buffer hits never include the `vector` field; server-side
+        fallback projects it out for parity.
+        """
+        async with self._flush_lock:
+            if id in self._pending_vector_deletes:
+                return None
+            pending = self._pending_vector_docs.get(id)
+            if pending is not None:
+                doc = dict(pending.source)
+                # Surface both _id (Mongo native) and id (API expectation).
+                doc.setdefault("_id", id)
+                doc["id"] = id
+                return doc
+
+        try:
+            result = await self._data.find_one({"_id": id}, {"vector": 0})
+            if result:
+                result_dict = dict(result)
+                if "_id" in result_dict and "id" not in result_dict:
+                    result_dict["id"] = result_dict["_id"]
+                return result_dict
+            return None
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error retrieving vector data for ID {id}: {e}"
+            )
+            return None
+
+    async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+        """Get multiple vector data by their IDs (read-your-writes), preserving order."""
+        if not ids:
+            return []
+
+        buffered: dict[str, dict[str, Any] | None] = {}
+        remaining: list[str] = []
+        async with self._flush_lock:
+            for doc_id in ids:
+                if doc_id in self._pending_vector_deletes:
+                    buffered[doc_id] = None
+                    continue
+                pending = self._pending_vector_docs.get(doc_id)
+                if pending is not None:
+                    doc = dict(pending.source)
+                    doc.setdefault("_id", doc_id)
+                    doc["id"] = doc_id
+                    buffered[doc_id] = doc
+                    continue
+                remaining.append(doc_id)
+
+        formatted_map: dict[str, dict[str, Any]] = {}
+        if remaining:
+            try:
+                cursor = self._data.find({"_id": {"$in": remaining}}, {"vector": 0})
+                results = await cursor.to_list(length=None)
+                for result in results:
+                    result_dict = dict(result)
+                    if "_id" in result_dict and "id" not in result_dict:
+                        result_dict["id"] = result_dict["_id"]
+                    key = str(result_dict.get("id", result_dict.get("_id")))
+                    formatted_map[key] = result_dict
+            except Exception as e:
+                logger.error(
+                    f"[{self.workspace}] Error retrieving vector data for IDs {remaining}: {e}"
+                )
+                return []
+
+        return [
+            buffered[doc_id] if doc_id in buffered else formatted_map.get(str(doc_id))
+            for doc_id in ids
+        ]
+
+    async def get_vectors_by_ids(self, ids: list[str]) -> dict[str, list[float]]:
+        """Get vector embeddings for given IDs, with read-your-writes.
+
+        Pending docs whose vector hasn't been embedded yet are embedded
+        lazily inside the lock; the resulting vector is cached on the
+        buffered `_PendingVectorDoc` so the next flush won't re-embed.
+
+        Visibility caveat for ids not in the buffer: the server-side
+        ``find`` fallback runs *outside* ``_flush_lock``. A concurrent
+        ``delete()`` that lands between lock release and the cursor
+        read only buffers the delete -- the old vector is still on disk
+        until the next flush, so this method may return a stale vector
+        for an id that has been buffered for deletion. This is
+        best-effort read-after-uncommitted-delete and matches the
+        ``query()`` contract: callers needing strict consistency must
+        ``index_done_callback()`` first.
+        """
+        if not ids:
+            return {}
+
+        result: dict[str, list[float]] = {}
+        remaining: list[str] = []
+        async with self._flush_lock:
+            docs_to_embed: list[tuple[str, _PendingVectorDoc]] = []
+            for doc_id in ids:
+                if doc_id in self._pending_vector_deletes:
+                    continue
+                pending = self._pending_vector_docs.get(doc_id)
+                if pending is not None:
+                    if pending.vector is None:
+                        docs_to_embed.append((doc_id, pending))
+                    else:
+                        result[doc_id] = pending.vector
+                    continue
+                remaining.append(doc_id)
+
+            if docs_to_embed:
+                contents = [pdoc.content for _, pdoc in docs_to_embed]
+                batches = [
+                    contents[i : i + self._max_batch_size]
+                    for i in range(0, len(contents), self._max_batch_size)
+                ]
+                try:
+                    embeddings_list = await asyncio.gather(
+                        *[
+                            self.embedding_func(batch, context="document")
+                            for batch in batches
+                        ]
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[{self.workspace}] Error lazily embedding pending vectors "
+                        f"(upserts={len(docs_to_embed)}): {e}"
+                    )
+                    raise
+                embeddings = np.concatenate(embeddings_list)
+                if len(embeddings) != len(docs_to_embed):
+                    raise RuntimeError(
+                        f"[{self.workspace}] Embedding count mismatch: expected "
+                        f"{len(docs_to_embed)}, got {len(embeddings)}"
+                    )
+                for i, ((doc_id, pdoc), embedding) in enumerate(
+                    zip(docs_to_embed, embeddings), start=1
+                ):
+                    pdoc.vector = np.array(embedding, dtype=np.float32).tolist()
+                    result[doc_id] = pdoc.vector
+                    await _cooperative_yield(i)
+
+        if not remaining:
+            return result
+
+        try:
+            cursor = self._data.find(
+                {"_id": {"$in": remaining}}, {"_id": 1, "vector": 1}
+            )
+            results = await cursor.to_list(length=None)
+            for row in results:
+                if row and "vector" in row and "_id" in row:
+                    result[row["_id"]] = row["vector"]
+            return result
+        except PyMongoError as e:
+            logger.error(f"[{self.workspace}] Error getting vectors: {e}")
+            return result
+
+    async def drop(self) -> dict[str, str]:
+        """Drop all documents and recreate the vector index. Destructive.
+
+        MUST only be called when ``pipeline_status`` is idle (see the
+        Pipeline concurrency contract in ``AGENTS.md``); the only
+        in-tree caller ``clear_documents`` enforces this.
+
+        Caveat — only this instance's buffers are cleared. Other
+        ``MongoVectorDBStorage`` instances aliased onto the same
+        ``final_namespace`` (multi-worker processes, or distinct
+        workspaces collapsed by ``MONGODB_WORKSPACE``) keep their own
+        buffers; a sibling whose prior flush failed and left buffers
+        intact will, on its next flush, bulk-write those stale rows into
+        the freshly recreated collection. Direct callers bypassing the
+        idle precondition MUST flush every aliased instance first.
+
+        Returns:
+            dict[str, str]: ``{"status": "success"|"error", "message": str}``
+        """
+        try:
+            async with self._flush_lock:
+                # Discard any buffered writes before the collection is wiped;
+                # a concurrent flush would otherwise resurrect them.
+                self._pending_vector_docs.clear()
+                self._pending_vector_deletes.clear()
+
+                # Delete all documents
+                result = await self._data.delete_many({})
+                deleted_count = result.deleted_count
+
+                # Recreate vector index
+                await self.create_vector_index_if_not_exists()
+
+            logger.info(
+                f"[{self.workspace}] Dropped {deleted_count} documents from vector storage {self._collection_name} and recreated vector index"
+            )
+            return {
+                "status": "success",
+                "message": f"{deleted_count} documents dropped and vector index recreated",
+            }
+        except PyMongoError as e:
+            logger.error(
+                f"[{self.workspace}] Error dropping vector storage {self._collection_name}: {e}"
+            )
+            return {"status": "error", "message": str(e)}
+
+
+async def get_or_create_collection(db: AsyncDatabase, collection_name: str):
+    collection_names = await db.list_collection_names()
+
+    if collection_name not in collection_names:
+        collection = await db.create_collection(collection_name)
+        logger.info(f"Created collection: {collection_name}")
+        return collection
+    else:
+        logger.debug(f"Collection '{collection_name}' already exists.")
+        return db.get_collection(collection_name)

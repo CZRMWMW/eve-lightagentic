@@ -1,0 +1,600 @@
+#!/usr/bin/env python3
+"""
+ABOUTME: Resolves automatic numbering labels from DOCX documents
+ABOUTME: Parses numbering.xml and computes rendered number strings
+"""
+
+import zipfile
+from defusedxml import ElementTree as ET
+from typing import Dict
+
+from lightrag.utils import logger
+
+NSMAP = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+
+class NumberingResolver:
+    """
+    Resolves paragraph numbering to rendered label strings.
+
+    DOCX stores numbering definitions in numbering.xml:
+    - abstractNum: Defines format templates (lvlText like "%1.%2.")
+    - num: Links numId to abstractNumId
+
+    Each paragraph references: numId (which definition) + ilvl (which level)
+    """
+
+    # Number format converters.
+    #
+    # The CJK families are NOT interchangeable — see [MS-DOCX] "numFmt
+    # Extensions" for the authoritative 1 / 10 / 100 sequences:
+    #   japaneseCounting / chineseCounting / taiwaneseCounting /
+    #   chineseCountingThousand  -> positional counting: 一 / 十 / …
+    #   ideographDigital         -> DIGIT-BY-DIGIT:      一 / 一〇 / 一〇〇
+    # Chinese-locale Word/WPS writes 一二三 auto-numbering as japaneseCounting
+    # (not chineseCounting), which is why both are mapped here.
+    FORMAT_CONVERTERS = {
+        "decimal": lambda n: str(n),
+        "lowerLetter": lambda n: chr(ord("a") + (n - 1) % 26),
+        "upperLetter": lambda n: chr(ord("A") + (n - 1) % 26),
+        "lowerRoman": lambda n: NumberingResolver._to_roman(n).lower(),
+        "upperRoman": lambda n: NumberingResolver._to_roman(n),
+        "chineseCounting": lambda n: NumberingResolver._to_chinese(n),
+        "chineseCountingThousand": lambda n: NumberingResolver._to_chinese(n),
+        "japaneseCounting": lambda n: NumberingResolver._to_chinese(n),
+        "taiwaneseCounting": lambda n: NumberingResolver._to_chinese(n),
+        "ideographDigital": lambda n: NumberingResolver._to_ideograph_digital(n),
+        "ideographTraditional": lambda n: "甲乙丙丁戊己庚辛壬癸"[(n - 1) % 10],
+        "bullet": lambda n: "•",
+        "none": lambda n: "",
+    }
+
+    #: numFmt -> the largest count its converter actually renders. Above the
+    #: limit the label degrades to the decimal string, which is legible and
+    #: obviously not a Chinese numeral (unlike the silent decimal default for an
+    #: UNMAPPED numFmt, where `（1）` passes for `（一）`). The counting families
+    #: all share ``_to_chinese``'s 1-99 domain, but they do NOT share a single
+    #: rendering above it: per [MS-DOCX] "numFmt Extensions" chineseCounting /
+    #: taiwaneseCounting switch to a U+25CB digit-by-digit form at 100 (一○○)
+    #: while chineseCountingThousand keeps counting (一百) — three renderings, no
+    #: corpus document that reaches any of them, so none is implemented. This
+    #: table exists to make the event FINDABLE: a real document that gets there
+    #: is the evidence needed to implement the right one.
+    LIMITED_DOMAIN_FORMATS = {
+        "chineseCounting": 99,
+        "chineseCountingThousand": 99,
+        "japaneseCounting": 99,
+        "taiwaneseCounting": 99,
+    }
+
+    def __init__(self, docx_path: str, *, warnings: Dict | None = None):
+        self.abstract_nums: Dict[str, dict] = {}  # abstractNumId -> level definitions
+        # abstractNumId -> {styleId -> ilvl}: per-level w:pStyle links. Word ties
+        # a multilevel list's levels to heading styles here; used to recover a
+        # paragraph's ilvl when its (direct or style-inherited) numPr omits it.
+        self.abstract_pstyle: Dict[str, Dict[str, int]] = {}
+        self.num_to_abstract: Dict[str, str] = {}  # numId -> abstractNumId
+        self.counters: Dict[
+            str, Dict[int, int]
+        ] = {}  # numId -> {ilvl -> current_count}
+        self.start_overrides: Dict[
+            str, Dict[int, int]
+        ] = {}  # numId -> {ilvl -> start_value}
+        self.style_numpr: Dict[
+            str, dict
+        ] = {}  # styleId -> {numId, ilvl} from styles.xml
+        self.style_based_on: Dict[str, str] = {}  # styleId -> basedOn styleId
+        # Smart numbering merge state (Word's rendering behavior)
+        self.last_numId: str = None  # Previous paragraph's numId
+        self.last_abstract_id: str = None  # Previous paragraph's abstractNumId
+        self.last_style_id: str = None  # Previous paragraph's style ID
+        # numFmt values this resolver cannot render, collected the first time
+        # each is hit. An unknown numFmt is a legitimate OOXML value we simply
+        # do not implement (not corruption), so the label still degrades to
+        # decimal — but never silently: a wrong-looking-yet-plausible label is
+        # harder to notice than an outright error.
+        self.unsupported_formats: set[str] = set()
+        # numFmt values that ARE implemented but were asked for a count outside
+        # their converter's domain (see LIMITED_DOMAIN_FORMATS), collected the
+        # first time each is hit.
+        self.out_of_range_formats: set[str] = set()
+        self._warnings = warnings
+        self._parse_numbering_xml(docx_path)
+        self._parse_styles_xml(docx_path)
+
+    def _note_unsupported_format(self, num_fmt: str) -> None:
+        """Record an unrenderable numFmt once. Must never raise: the callers
+        (:meth:`get_label` / :meth:`_format_label`) swallow exceptions to keep
+        document parsing alive, so a raise here would be invisible."""
+        if not num_fmt or num_fmt in self.unsupported_formats:
+            return
+        self.unsupported_formats.add(num_fmt)
+        logger.warning(
+            "Unsupported numbering format '%s' rendered as decimal; "
+            "auto-numbering labels for those paragraphs may be wrong",
+            num_fmt,
+        )
+        if self._warnings is not None:
+            self._warnings["numbering_unsupported_formats"] = len(
+                self.unsupported_formats
+            )
+
+    def _note_out_of_range(self, num_fmt: str, count: int) -> None:
+        """Record a count a SUPPORTED numFmt cannot render, once per numFmt.
+
+        Same contract as :meth:`_note_unsupported_format`: must never raise
+        (the callers swallow exceptions, so a raise here would be invisible),
+        and the label still renders — as decimal — rather than failing the
+        document.
+        """
+        limit = self.LIMITED_DOMAIN_FORMATS.get(num_fmt)
+        if limit is None or count <= limit or num_fmt in self.out_of_range_formats:
+            return
+        self.out_of_range_formats.add(num_fmt)
+        logger.warning(
+            "Numbering format '%s' cannot render count %d (supported up to %d); "
+            "those labels fall back to decimal",
+            num_fmt,
+            count,
+            limit,
+        )
+        if self._warnings is not None:
+            self._warnings["numbering_out_of_range_formats"] = len(
+                self.out_of_range_formats
+            )
+
+    def _parse_numbering_xml(self, docx_path: str):
+        """Parse numbering.xml from DOCX archive"""
+        try:
+            with zipfile.ZipFile(docx_path, "r") as zf:
+                if "word/numbering.xml" not in zf.namelist():
+                    return
+
+                tree = ET.parse(zf.open("word/numbering.xml"))
+                root = tree.getroot()
+
+                # Parse abstractNum definitions
+                for abstract in root.findall(".//w:abstractNum", NSMAP):
+                    abstract_id = abstract.get(f"{{{NSMAP['w']}}}abstractNumId")
+                    levels = {}
+                    pstyle_map: Dict[str, int] = {}
+
+                    for lvl in abstract.findall("w:lvl", NSMAP):
+                        ilvl = int(lvl.get(f"{{{NSMAP['w']}}}ilvl"))
+
+                        # Per-level style link (multilevel-list-linked-to-styles).
+                        # First binding wins on conflict; never raise on bad XML.
+                        pstyle_elem = lvl.find("w:pStyle", NSMAP)
+                        if pstyle_elem is not None:
+                            pstyle_val = pstyle_elem.get(f"{{{NSMAP['w']}}}val")
+                            if pstyle_val and pstyle_val not in pstyle_map:
+                                pstyle_map[pstyle_val] = ilvl
+
+                        start_elem = lvl.find("w:start", NSMAP)
+                        start = (
+                            int(start_elem.get(f"{{{NSMAP['w']}}}val"))
+                            if start_elem is not None
+                            else 1
+                        )
+
+                        num_fmt_elem = lvl.find("w:numFmt", NSMAP)
+                        num_fmt = (
+                            num_fmt_elem.get(f"{{{NSMAP['w']}}}val")
+                            if num_fmt_elem is not None
+                            else "decimal"
+                        )
+
+                        lvl_text_elem = lvl.find("w:lvlText", NSMAP)
+                        lvl_text = (
+                            lvl_text_elem.get(f"{{{NSMAP['w']}}}val")
+                            if lvl_text_elem is not None
+                            else "%1."
+                        )
+
+                        is_lgl_elem = lvl.find("w:isLgl", NSMAP)
+                        is_lgl = False
+                        if is_lgl_elem is not None:
+                            val = is_lgl_elem.get(f"{{{NSMAP['w']}}}val")
+                            is_lgl = val is None or val not in ("0", "false")
+
+                        levels[ilvl] = {
+                            "start": start,
+                            "numFmt": num_fmt,
+                            "lvlText": lvl_text,
+                            "isLgl": is_lgl,
+                        }
+
+                    self.abstract_nums[abstract_id] = levels
+                    if pstyle_map:
+                        self.abstract_pstyle[abstract_id] = pstyle_map
+
+                # Parse num -> abstractNum mapping and startOverride
+                for num in root.findall(".//w:num", NSMAP):
+                    num_id = num.get(f"{{{NSMAP['w']}}}numId")
+                    abstract_ref = num.find("w:abstractNumId", NSMAP)
+                    if abstract_ref is not None:
+                        self.num_to_abstract[num_id] = abstract_ref.get(
+                            f"{{{NSMAP['w']}}}val"
+                        )
+
+                    # Parse lvlOverride/startOverride for this num
+                    for lvl_override in num.findall("w:lvlOverride", NSMAP):
+                        ilvl = int(lvl_override.get(f"{{{NSMAP['w']}}}ilvl"))
+                        start_override = lvl_override.find("w:startOverride", NSMAP)
+                        if start_override is not None:
+                            start_val = int(start_override.get(f"{{{NSMAP['w']}}}val"))
+                            if num_id not in self.start_overrides:
+                                self.start_overrides[num_id] = {}
+                            self.start_overrides[num_id][ilvl] = start_val
+        except Exception:
+            # Silently ignore parsing errors - document may not have numbering
+            pass
+
+    def _parse_styles_xml(self, docx_path: str):
+        """Parse styles.xml to get style-inherited numbering definitions"""
+        try:
+            with zipfile.ZipFile(docx_path, "r") as zf:
+                if "word/styles.xml" not in zf.namelist():
+                    return
+
+                tree = ET.parse(zf.open("word/styles.xml"))
+                root = tree.getroot()
+
+                # Parse style definitions
+                for style in root.findall(".//w:style", NSMAP):
+                    style_id = style.get(f"{{{NSMAP['w']}}}styleId")
+                    if not style_id:
+                        continue
+
+                    # Check for basedOn (style inheritance)
+                    based_on = style.find("w:basedOn", NSMAP)
+                    if based_on is not None:
+                        parent_id = based_on.get(f"{{{NSMAP['w']}}}val")
+                        if parent_id:
+                            self.style_based_on[style_id] = parent_id
+
+                    # Check for numPr in style's pPr
+                    pPr = style.find("w:pPr", NSMAP)
+                    if pPr is not None:
+                        numPr = pPr.find("w:numPr", NSMAP)
+                        if numPr is not None:
+                            num_id_elem = numPr.find("w:numId", NSMAP)
+                            ilvl_elem = numPr.find("w:ilvl", NSMAP)
+
+                            if num_id_elem is not None:
+                                num_id = num_id_elem.get(f"{{{NSMAP['w']}}}val")
+                                # ilvl=None marks "absent" (distinct from an
+                                # explicit 0) so _get_numbering_from_style can
+                                # inherit an explicit ilvl from the basedOn chain.
+                                ilvl = (
+                                    int(ilvl_elem.get(f"{{{NSMAP['w']}}}val"))
+                                    if ilvl_elem is not None
+                                    else None
+                                )
+                                self.style_numpr[style_id] = {
+                                    "numId": num_id,
+                                    "ilvl": ilvl,
+                                }
+        except Exception:
+            # Silently ignore parsing errors
+            pass
+
+    def _get_numbering_from_style(self, style_id: str, visited=None) -> dict:
+        """
+        Get numbering definition from style, following the basedOn chain.
+
+        numId and ilvl are inherited INDEPENDENTLY (OOXML numPr child-level
+        merge): a derived style that overrides only numId still inherits the
+        parent's explicit ilvl. ``numId`` is taken from the nearest ancestor
+        (incl. self) that defines it; ``ilvl`` from the nearest ancestor that
+        defines it EXPLICITLY (styles that omit w:ilvl store ilvl=None).
+
+        Args:
+            style_id: Style ID to look up
+            visited: Set of visited style IDs (to prevent circular references)
+
+        Returns:
+            dict with 'numId' and 'ilvl' (ilvl may be None), or None if no
+            style in the chain declares a numId.
+        """
+        if visited is None:
+            visited = set()
+
+        num_id = None
+        ilvl = None
+        sid = style_id
+        while sid and sid not in visited:
+            visited.add(sid)
+            entry = self.style_numpr.get(sid)
+            if entry:
+                if num_id is None and entry.get("numId") is not None:
+                    num_id = entry["numId"]
+                if ilvl is None and entry.get("ilvl") is not None:
+                    ilvl = entry["ilvl"]
+            if num_id is not None and ilvl is not None:
+                break
+            sid = self.style_based_on.get(sid)
+
+        if num_id is None:
+            return None
+        return {"numId": num_id, "ilvl": ilvl}
+
+    def _resolve_ilvl_by_pstyle(self, num_id: str, style_id: str):
+        """
+        Recover ilvl from the abstractNum's per-level w:pStyle link.
+
+        When a paragraph's numbering omits ilvl, Word derives it from the
+        multilevel list's style link: the level whose w:pStyle matches the
+        paragraph's style (or one of its basedOn ancestors). Returns the
+        matched ilvl, or None.
+        """
+        if not style_id:
+            return None
+        abstract_id = self.num_to_abstract.get(num_id)
+        pstyle_map = self.abstract_pstyle.get(abstract_id)
+        if not pstyle_map:
+            return None
+        sid = style_id
+        seen = set()
+        while sid and sid not in seen:
+            seen.add(sid)
+            if sid in pstyle_map:
+                return pstyle_map[sid]
+            sid = self.style_based_on.get(sid)
+        return None
+
+    def reset_tracking_state(self):
+        """
+        Reset numbering tracking state.
+
+        Call this when encountering structural breaks that should
+        interrupt numbering continuity:
+        - Section breaks (sectPr)
+        - Table boundaries (before and after tables)
+
+        This prevents incorrect numbering continuation across
+        document structure boundaries.
+        """
+        self.last_numId = None
+        self.last_abstract_id = None
+        self.last_style_id = None
+
+    def get_label(self, para_element) -> str:
+        """
+        Get rendered numbering label for a paragraph.
+
+        Checks both direct numPr and style-inherited numbering. Direct numPr
+        is a paragraph-local override and applies only to the current
+        paragraph; subsequent paragraphs that carry only pStyle fall back to
+        the style's numPr declared in styles.xml.
+
+        Args:
+            para_element: lxml Element for <w:p>
+
+        Returns:
+            Rendered label string (e.g., "1.1", "a)", "第一章") or empty string
+        """
+        try:
+            pPr = para_element.find(f"{{{NSMAP['w']}}}pPr")
+            if pPr is None:
+                return ""
+
+            num_id = None
+            ilvl = None  # None = "unresolved"; a real ilvl may legitimately be 0
+            style_id = None
+
+            # Get pStyle (if present)
+            pStyle = pPr.find(f"{{{NSMAP['w']}}}pStyle")
+            if pStyle is not None:
+                style_id = pStyle.get(f"{{{NSMAP['w']}}}val")
+
+            # Check for direct numPr in paragraph. numId is the authoritative
+            # paragraph-local override; ilvl may be absent (kept None so the
+            # style-chain / pStyle-link fallbacks below can supply it — an
+            # explicit ilvl=0 is NOT treated as absent).
+            numPr = pPr.find(f"{{{NSMAP['w']}}}numPr")
+            if numPr is not None:
+                num_id_elem = numPr.find(f"{{{NSMAP['w']}}}numId")
+                ilvl_elem = numPr.find(f"{{{NSMAP['w']}}}ilvl")
+
+                if num_id_elem is not None:
+                    num_id = num_id_elem.get(f"{{{NSMAP['w']}}}val")
+                    if ilvl_elem is not None:
+                        ilvl = int(ilvl_elem.get(f"{{{NSMAP['w']}}}val"))
+
+            # Fall back to style-inherited numbering for a MISSING numId AND/OR
+            # a missing ilvl. Gating on ``ilvl is None`` too (not just num_id)
+            # covers a direct numPr that carries numId but omits ilvl: the
+            # direct numId is preserved, only the ilvl is borrowed from the
+            # style's basedOn chain. Direct numPr stays a paragraph-local
+            # override — the tracking state below keys off the resolved num_id.
+            if num_id is None or ilvl is None:
+                if style_id:
+                    style_num = self._get_numbering_from_style(style_id)
+                    if style_num:
+                        if num_id is None:
+                            num_id = style_num["numId"]
+                        if ilvl is None:
+                            ilvl = style_num["ilvl"]
+
+            # If still no numbering found, clear state and return empty
+            if num_id is None:
+                # We should use list structure breaking logic to reset last_numId, last_abstract_id and last_style_id
+                return ""
+
+            # ilvl still unresolved: recover from the abstractNum's per-level
+            # pStyle link (multilevel-list-linked-to-styles), else default 0.
+            if ilvl is None:
+                ilvl = self._resolve_ilvl_by_pstyle(num_id, style_id)
+            if ilvl is None:
+                ilvl = 0
+
+            # Get abstract definition
+            abstract_id = self.num_to_abstract.get(num_id)
+            if abstract_id is None or abstract_id not in self.abstract_nums:
+                # Clear state for invalid numbering
+                self.last_numId = None
+                self.last_abstract_id = None
+                return ""
+
+            levels = self.abstract_nums[abstract_id]
+            if ilvl not in levels:
+                # Clear state for invalid level
+                self.last_numId = None
+                self.last_abstract_id = None
+                return ""
+
+            # Smart numbering merge: (Word's rendering behavior)
+            # When consecutive paragraphs have different numId but same abstractNumId,
+            # Word continues the numbering sequence rather than restarting.
+            # This happens regardless of whether the numId is new or style matches.
+
+            if (
+                self.last_numId is not None
+                and self.last_numId != num_id
+                and self.last_abstract_id == abstract_id
+                and self.last_numId in self.counters
+            ):
+                # Merge: copy previous numId's counter to current numId
+                self.counters[num_id] = self.counters[self.last_numId].copy()
+
+            # Initialize/update counter
+            if num_id not in self.counters:
+                self.counters[num_id] = {}
+
+            # Initialize all parent levels if not present (for deep nested numbering)
+            for i in range(ilvl):
+                if i not in self.counters[num_id] and i in levels:
+                    # Use startOverride if exists, otherwise use abstractNum's start value
+                    if (
+                        num_id in self.start_overrides
+                        and i in self.start_overrides[num_id]
+                    ):
+                        self.counters[num_id][i] = self.start_overrides[num_id][i]
+                    else:
+                        self.counters[num_id][i] = levels[i]["start"]
+
+            # Reset lower levels when higher level increments
+            for i in range(ilvl + 1, 10):
+                if i in self.counters[num_id]:
+                    del self.counters[num_id][i]
+
+            # Initialize current level if needed
+            if ilvl not in self.counters[num_id]:
+                # Use startOverride if exists, otherwise use abstractNum's start value
+                if (
+                    num_id in self.start_overrides
+                    and ilvl in self.start_overrides[num_id]
+                ):
+                    self.counters[num_id][ilvl] = self.start_overrides[num_id][ilvl]
+                else:
+                    self.counters[num_id][ilvl] = levels[ilvl]["start"]
+            else:
+                self.counters[num_id][ilvl] += 1
+
+            # Format the label using lvlText template
+            label = self._format_label(num_id, ilvl, levels)
+
+            # Update tracking state for next paragraph
+            self.last_numId = num_id
+            self.last_abstract_id = abstract_id
+            self.last_style_id = style_id
+
+            return label
+        except Exception:
+            # Return empty on any error to avoid breaking document parsing
+            return ""
+
+    def _format_label(self, num_id: str, ilvl: int, levels: dict) -> str:
+        """Format label string by replacing %1, %2, etc."""
+        try:
+            lvl_text = levels[ilvl]["lvlText"]
+            result = lvl_text
+            current_is_lgl = levels[ilvl].get("isLgl", False)
+
+            for i in range(ilvl + 1):
+                if i in levels and i in self.counters.get(num_id, {}):
+                    num_fmt = levels[i]["numFmt"]
+                    if current_is_lgl and i < ilvl:
+                        num_fmt = "decimal"
+                    count = self.counters[num_id][i]
+                    converter = self.FORMAT_CONVERTERS.get(num_fmt)
+                    if converter is None:
+                        self._note_unsupported_format(num_fmt)
+                        converter = str
+                    else:
+                        self._note_out_of_range(num_fmt, count)
+                    formatted = converter(count)
+                    result = result.replace(f"%{i + 1}", formatted)
+
+            return result
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _to_roman(n: int) -> str:
+        """Convert integer to Roman numeral"""
+        if n <= 0 or n >= 4000:
+            return str(n)
+        values = [
+            (1000, "M"),
+            (900, "CM"),
+            (500, "D"),
+            (400, "CD"),
+            (100, "C"),
+            (90, "XC"),
+            (50, "L"),
+            (40, "XL"),
+            (10, "X"),
+            (9, "IX"),
+            (5, "V"),
+            (4, "IV"),
+            (1, "I"),
+        ]
+        result = ""
+        for value, numeral in values:
+            while n >= value:
+                result += numeral
+                n -= value
+        return result
+
+    @staticmethod
+    def _to_chinese(n: int) -> str:
+        """Convert integer to a POSITIONAL Chinese numeral (10 -> 十).
+
+        Backs the counting families (japaneseCounting / chineseCounting /
+        taiwaneseCounting / chineseCountingThousand). Covers 1-99 and falls back
+        to the decimal string beyond that: [MS-DOCX] switches chineseCounting /
+        taiwaneseCounting to a U+25CB digit-by-digit form at 100 (一○○) which is
+        NOT what this produces, and list numbering practically never gets there.
+        For the digit-by-digit ideograph family use
+        :meth:`_to_ideograph_digital` — 10 renders 一〇 there, not 十.
+        """
+        digits = "零一二三四五六七八九"
+        if n <= 0 or n > 99:
+            return str(n)
+        if n < 10:
+            return digits[n]
+        if n < 20:
+            return "十" + (digits[n % 10] if n % 10 else "")
+        if n < 100:
+            tens = n // 10
+            ones = n % 10
+            return digits[tens] + "十" + (digits[ones] if ones else "")
+        return str(n)
+
+    @staticmethod
+    def _to_ideograph_digital(n: int) -> str:
+        """Convert integer to DIGIT-BY-DIGIT ideographs (10 -> 一〇).
+
+        The ``ideographDigital`` format is positional in the decimal sense, not
+        a counting system: per [MS-DOCX] "numFmt Extensions" the sequence for
+        1 / 10 / 100 is U+4E00 / U+4E00 U+3007 / U+4E00 U+3007 U+3007, i.e.
+        一 / 一〇 / 一〇〇. Zero is U+3007 IDEOGRAPHIC NUMBER ZERO 〇 — note this
+        differs from the U+25CB WHITE CIRCLE ○ that chineseCounting /
+        taiwaneseCounting use at 100.
+        """
+        if n <= 0:
+            return str(n)
+        digits = "〇一二三四五六七八九"
+        return "".join(digits[int(ch)] for ch in str(n))
