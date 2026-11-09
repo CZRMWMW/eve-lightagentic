@@ -104,7 +104,7 @@ def _db_config() -> dict[str, Any]:
     return {
         "host": os.getenv("EVE_FITTINGS_DB_HOST", "127.0.0.1"),
         "port": int(os.getenv("EVE_FITTINGS_DB_PORT", "3306")),
-        "user": os.getenv("EVE_FITTINGS_DB_USER", "eve"),
+        "user": os.getenv("EVE_FITTINGS_DB_USER", "shokaku"),
         "password": os.getenv("EVE_FITTINGS_DB_PASSWORD", ""),
         "database": os.getenv("EVE_FITTINGS_DB_NAME", DEFAULT_DATABASE),
         "charset": "utf8mb4",
@@ -263,7 +263,11 @@ def ensure_schema(conn: pymysql.connections.Connection) -> None:
 
 
 def import_sources(source_dir: Path = DEFAULT_SOURCE_DIR) -> dict[str, int]:
-    source_paths = sorted(source_dir.glob("*.xml"))
+    source_paths = [
+        source_dir / "SG軍團裝配.xml",
+        source_dir / "WC裝配.xml",
+        source_dir / "niewii8866個人裝備.xml",
+    ]
     parsed = [(path, parse_source(path)) for path in source_paths if path.is_file()]
     fittings_table, items_table = _identifiers()
     imported_fittings = 0
@@ -477,7 +481,7 @@ def find_fittings_for_simulation(
             str(row.get("ship_name_local", "") or ""),
         ]
         if any(
-            alias and _contains_search_term(combined.casefold(), alias.casefold())
+            alias and _fitting_search_match(combined, alias)
             for alias in aliases
         ):
             exact_rows.append(row)

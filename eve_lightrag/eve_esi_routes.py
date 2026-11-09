@@ -9,8 +9,8 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from eve_lightrag import eve_esi_bindings as store
-from eve_lightrag.query_skills import run_eve_db_call
+from . import eve_esi_bindings as store
+from .query_skills import run_eve_db_call
 
 HEADERS = {'Cache-Control':'no-store','Referrer-Policy':'no-referrer',
            'X-Content-Type-Options':'nosniff',
@@ -34,7 +34,7 @@ class BindLinkRequest(BaseModel):
 
 
 def _page(content,status=200):
-    template = Path(__file__).with_name('eve_bind.html').read_text(encoding='utf-8')
+    template = (Path(__file__).with_name('eve_bind.html')).read_text(encoding='utf-8')
     return HTMLResponse(template.replace('<!-- CONTENT -->',content),status_code=status,headers=HEADERS)
 
 

@@ -40,7 +40,7 @@ def _db_config() -> dict[str, Any]:
     return {
         "host": os.getenv("EVE_FITTINGS_DB_HOST", "127.0.0.1"),
         "port": int(os.getenv("EVE_FITTINGS_DB_PORT", "3306")),
-        "user": os.getenv("EVE_FITTINGS_DB_USER", "eve"),
+        "user": os.getenv("EVE_FITTINGS_DB_USER", "shokaku"),
         "password": os.getenv("EVE_FITTINGS_DB_PASSWORD", ""),
         "database": os.getenv("EVE_FITTINGS_DB_NAME", DEFAULT_DATABASE),
         "charset": "utf8mb4",
@@ -226,7 +226,7 @@ def query_static_data(
         return _query_webifier_catalog(limit)
     search_query = _extract_static_subject(query) if dataset == "types" else query
     if not record_key and search_query:
-        from eve_lightrag.eve_names import resolve_name
+        from .eve_names import resolve_name
 
         official = resolve_name(search_query, _safe_dataset(dataset) if dataset else None)
         if official:

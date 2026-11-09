@@ -5,13 +5,13 @@ import threading
 import time
 from collections import defaultdict
 
-from eve_lightrag.eve_static_data import connection
+from .eve_static_data import connection
 
 TABLE = "eve_sde_names"
 _lock = threading.RLock()
 _cache = None
 _loaded = 0.0
-_protected = re.compile(r"```[\s\S]*?(?:```|\Z)|~~~[\s\S]*?(?:~~~|\Z)|^\[[^\]\n]+,[^\]\n]+\]\n[\s\S]*\Z|`[^`\n]*`|https?://[^\s<>]+|\]\([^\n)]*\)|\bPyfa(?:/Eos)?\b", re.MULTILINE | re.IGNORECASE)
+_protected = re.compile(r"```[\s\S]*?(?:```|\Z)|~~~[\s\S]*?(?:~~~|\Z)|^\[[^\]\n]+,[^\]\n]+\]\n[\s\S]*\Z|`[^`\n]*`|https?://[^\s<>]+|\]\([^\n)]*\)|\bPyfa(?:[ /]Eos)?\b|\bLang(?:Graph|Chain)\b", re.MULTILINE | re.IGNORECASE)
 # These are also SDE names, but ordinary prose cannot disambiguate them.
 # Exact lookups remain available with dataset/ID, even for these terms.
 _ambiguous_prose = frozenset(('static', 'test', 'access', 'tool', 'tools',

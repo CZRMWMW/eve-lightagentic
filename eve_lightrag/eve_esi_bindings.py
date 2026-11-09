@@ -1,6 +1,7 @@
 """Dedicated ESI authorization storage for LightRAG skills."""
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ import jwt
 import pymysql
 import requests
 
-from eve_lightrag.eve_static_data import connection
+from .eve_static_data import connection
 
 SCOPES = ('esi-skills.read_skills.v1', 'esi-skills.read_skillqueue.v1')
 TOKEN_URL = 'https://login.eveonline.com/v2/oauth/token'
@@ -35,8 +36,7 @@ class ReauthorizationRequired(ValueError):
 
 
 def _cipher():
-    path = Path(os.getenv('EVE_SKILL_KEY_FILE', str(Path(os.getenv('EVE_DATA_DIR', 'data')) / '.eve_skill_tokens.key')))
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = Path(os.getenv('EVE_SKILL_KEY_FILE', 'data/.eve_skill_tokens.key'))
     if not path.exists():
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -127,6 +127,39 @@ def binding_ready():
         return False
 
 
+def migrate_legacy():
+    """One-time copy only; credentials are re-encrypted, source rows untouched."""
+    spec = importlib.util.spec_from_file_location('_esi_migration_config',
+        os.getenv('EVE_LEGACY_CONFIG_FILE', ''))
+    config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config)
+    legacy_cipher = Fernet(config.TOKEN_ENCRYPT_KEY.encode())
+    source = pymysql.connect(host=config.MYSQL_HOST, port=config.MYSQL_PORT,
+        user=config.MYSQL_USER, password=config.MYSQL_PASSWORD, database=config.MYSQL_DB,
+        charset='utf8mb4', cursorclass=pymysql.cursors.DictCursor, connect_timeout=10)
+    try:
+        with source.cursor() as q:
+            q.execute('SELECT * FROM eve_characters')
+            rows = q.fetchall()
+    finally:
+        source.close()
+    configure_client(config.EVE_CLIENT_ID, config.EVE_CLIENT_SECRET,
+                     config.EVE_CALLBACK_URL, 'legacy')
+    copied = 0
+    with connection() as conn, conn.cursor() as q:
+        for row in rows:
+            refresh = legacy_cipher.decrypt(row['refresh_token'].encode()).decode()
+            q.execute('''INSERT IGNORE INTO eve_skill_characters
+                (character_id,character_name,owner_hash,client_key,access_cipher,
+                 refresh_cipher,scopes,token_expires_at,migrated_from)
+                VALUES (%s,%s,%s,'legacy',%s,%s,%s,%s,%s)''',
+                (row['character_id'],row['character_name'],row.get('owner_hash') or '',
+                 _encrypt(row.get('access_token') or ''),_encrypt(refresh),
+                 row.get('scopes') or '',row['token_expires_at'],
+                 config.MYSQL_DB + '.eve_characters'))
+            copied += q.rowcount
+        conn.commit()
+    return {'source_count':len(rows), 'copied':copied}
 
 
 def list_all_characters():

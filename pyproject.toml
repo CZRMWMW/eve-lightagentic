@@ -25,6 +25,8 @@ dependencies = [
     "requests>=2.31",
     "cryptography>=42",
     "PyJWT>=2.8",
+    "langchain-core>=1.6,<2",
+    "langgraph>=1.2,<2",
     "aiohttp",
     "configparser",
     "google-api-core>=2.0.0,<3.0.0",

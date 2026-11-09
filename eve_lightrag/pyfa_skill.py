@@ -20,14 +20,14 @@ from pathlib import Path
 from typing import Any
 
 
-PYFA_ROOT = Path(os.getenv("PYFA_ROOT", "vendor/Pyfa"))
-EXTENSION_ROOT = Path(__file__).resolve().parent.parent
+PYFA_ROOT = Path(os.getenv("PYFA_ROOT", "data/pyfa"))
+CODEX_ROOT = Path(os.getenv("EVE_EXTENSION_ROOT", "."))
 PYFA_PYTHON = PYFA_ROOT / ".venv" / "bin" / "python"
 _EOS_LOCK = threading.RLock()
 _EOS_READY = False
 
-if str(EXTENSION_ROOT) not in sys.path:
-    sys.path.insert(0, str(EXTENSION_ROOT))
+if str(CODEX_ROOT) not in sys.path:
+    sys.path.insert(0, str(CODEX_ROOT))
 
 
 def _ensure_eos() -> tuple[Any, Any, Any, Any]:
@@ -35,8 +35,8 @@ def _ensure_eos() -> tuple[Any, Any, Any, Any]:
     global _EOS_READY
     if str(PYFA_ROOT) not in sys.path:
         sys.path.insert(0, str(PYFA_ROOT))
-    if str(EXTENSION_ROOT) not in sys.path:
-        sys.path.insert(0, str(EXTENSION_ROOT))
+    if str(CODEX_ROOT) not in sys.path:
+        sys.path.insert(0, str(CODEX_ROOT))
 
     # eos.db imports Pyfa's root config through the migration module. Only
     # Colour is needed during config import; the rest of the GUI is irrelevant.
@@ -87,7 +87,7 @@ def _resolve_type_id(name_or_id: Any) -> tuple[int | None, str]:
     if not name:
         return None, ""
 
-    from eve_lightrag.eve_names import resolve_name
+    from .eve_names import resolve_name
 
     official = resolve_name(name, "types")
     if official is not None:
@@ -113,7 +113,7 @@ def _resolve_type_id(name_or_id: Any) -> tuple[int | None, str]:
         pass
 
     # Reuse the existing MySQL SDE name matching, including Chinese aliases.
-    from eve_lightrag.eve_static_data import query_static_data
+    from .eve_static_data import query_static_data
 
     rows = query_static_data(name, "types", None, 20)
     ranked = sorted(
@@ -244,7 +244,7 @@ def _resolve_skill_id(name_or_id: Any) -> tuple[int | None, str]:
             return int(item.ID), str(item.typeName)
     except Exception:
         pass
-    from eve_lightrag.eve_static_data import query_static_data
+    from .eve_static_data import query_static_data
 
     rows = query_static_data(text, "types", None, 20)
     skill_rows = [
@@ -304,7 +304,7 @@ def _build_character(
         character_ref = payload.get("character_id", payload.get("character"))
         if character_ref is None:
             raise ValueError("skills_source=esi 时必须提供 character_id 或 character")
-        from eve_lightrag.eve_character_skills import get_character_skill_levels
+        from .eve_character_skills import get_character_skill_levels
 
         levels, metadata = get_character_skill_levels(
             character_ref,
@@ -388,7 +388,9 @@ def _skill_report(
             int(character.getSkill(skill_id).level) if character is not None else 0
         )
         current_sp = int(
-            (skill_metadata.get("skillpoints_by_id") or {}).get(str(skill_id), 0)
+            (skill_metadata.get("skillpoints_by_id") or {}).get(
+                str(skill_id), _skill_points_to_level(skill_item, current_level)
+            )
         )
         required_level = requirement["required_level"]
         required_sp = _skill_points_to_level(skill_item, required_level)
@@ -513,6 +515,27 @@ def _parse_eft_module_line(line: str, slot: str) -> dict[str, Any]:
     if len(parts) > 1 and parts[1]:
         entry["charge"] = parts[1]
     return entry
+
+
+def normalize_fitting_slots(payload: dict[str, Any], reset_states: bool = False) -> dict[str, Any]:
+    """Use Eos module slots rather than the order of pasted EFT sections."""
+    normalized = deepcopy(payload)
+    slot_names = {1: 'low', 2: 'mid', 3: 'high', 4: 'rig', 5: 'subsystem', 8: 'service'}
+    slots = {name: [] for name in slot_names.values()}
+    with _EOS_LOCK:
+        db, _fit, _ship, modules = _ensure_eos()
+        for requested_slot in slots:
+            for entry in _normalize_module_entries(payload.get(requested_slot, [])):
+                type_id, _ = _resolve_type_id(entry['name'])
+                item = db.getItem(type_id) if type_id is not None else None
+                slot = requested_slot
+                if item is not None:
+                    slot = slot_names.get(int(modules.Module(item).slot), requested_slot)
+                if reset_states and entry.get('state') != 'offline':
+                    entry['state'] = _module_state_for_name(slot, str(entry['name']))
+                slots[slot].append(entry)
+    normalized.update(slots)
+    return normalized
 
 
 def parse_eft_fit(text: str, skills_source: str = "default") -> dict[str, Any] | None:
@@ -760,7 +783,7 @@ def compare_fitting_skill_requirements(
     with _EOS_LOCK:
         db, _fit_module, _ship_module, _module_module = _ensure_eos()
         from eos.saveddata.character import Character
-        from eve_lightrag.eve_character_skills import get_character_skill_levels
+        from .eve_character_skills import get_character_skill_levels
 
         levels, metadata = get_character_skill_levels(character_ref)
         character = Character(str(metadata["character_name"]), initSkills=False)
@@ -809,7 +832,7 @@ def recommend_fittings_for_character(
     max_results: int = 5,
 ) -> list[dict[str, Any]]:
     """Run every candidate fitting through Eos with one character skill snapshot."""
-    from eve_lightrag.eve_character_skills import get_character_skill_levels
+    from .eve_character_skills import get_character_skill_levels
 
     levels, metadata = get_character_skill_levels(character_ref)
     evaluated: list[dict[str, Any]] = []

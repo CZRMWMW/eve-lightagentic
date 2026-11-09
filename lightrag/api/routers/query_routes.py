@@ -31,43 +31,18 @@ from lightrag.query_validation import validate_query_not_empty, validate_rag_que
 from lightrag.utils import logger
 from lightrag.api.eve_fittings import (
     dataset_names,
-    format_static_context,
-    format_skill_context,
-    find_fittings,
-    find_fittings_for_simulation,
-    filter_fittings_by_ship_query,
-    find_fitting_targets_in_text,
     find_all_fittings,
-    fitting_lookup_query,
-    format_context,
-    is_static_data_query,
-    preferred_static_dataset,
-    is_fitting_query,
-    needs_multi_layer_agent,
     query_static_data,
     simulate_fitting,
-    fitting_to_simulation_payload,
-    compare_fitting_skill_requirements,
-    recommend_fittings_for_character,
-    contains_eft_fit,
-    parse_eft_fit,
-    build_fit_variants_from_request,
-    simulate_fit_variants,
     list_authorized_characters,
-    resolve_character,
     get_character_skill_data,
-    find_character_in_text,
     plan_skills,
-    needs_skill_fitting_recommendation,
-    needs_character_fitting_analysis,
-    run_multi_layer_agent,
-    extract_simulation_payload,
     query_neo4j,
     query_milvus,
     run_eve_db_call,
     SKILL_NAMES,
     SKILL_DESCRIPTIONS,
-    DEFAULT_GAME_CONTEXT,
+    EveQueryAgent,
 )
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -417,693 +392,57 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-async def _attach_eve_fitting_context(request: QueryRequest, param: QueryParam) -> bool:
-    """Add exact MySQL fitting data only for fitting/loadout requests."""
-    lookup_query = fitting_lookup_query(request.query, request.conversation_history)
-    if not is_fitting_query(lookup_query):
-        logger.info("EVE fitting lookup skipped: query is not a fitting request")
-        return False
-
-    try:
-        configured_limit = int(os.getenv("EVE_FITTINGS_QUERY_LIMIT", "0"))
-        limit = None if configured_limit <= 0 else configured_limit
-        fittings = await run_eve_db_call(find_fittings, lookup_query, limit)
-    except Exception:
-        logger.warning("EVE fitting lookup failed; continuing with normal RAG query", exc_info=True)
-        return False
-    if not fittings:
-        logger.info("EVE fitting lookup returned no matching ship/fitting")
-        return False
-
-    context = format_context(fittings)
-    max_chars = int(os.getenv("EVE_FITTINGS_CONTEXT_MAX_CHARS", "0"))
-    if max_chars > 0 and len(context) > max_chars:
-        context = context[:max_chars].rstrip() + "\n[装配数据已截断]"
-    fitting_instruction = (
-        "\n\n"
-        "【EVE 装配数据库结果】\n"
-        f"{context}\n"
-        "回答本次舰船装配问题时，以上 MySQL 数据优先于知识库中的冲突信息。"
-        "数据库返回的每一个装配方案都必须保留并逐一列出，不得合并、遗漏或只选择其中几套。"
-    )
-    param.user_prompt = (param.user_prompt or "") + fitting_instruction
-    return True
 
 
-async def _attach_eve_static_context(request: QueryRequest, param: QueryParam, force: bool = False) -> bool:
-    """Add only relevant SDE records to the LLM prompt."""
-    lookup_query = fitting_lookup_query(request.query, request.conversation_history)
-    if not force and (is_fitting_query(lookup_query) or not is_static_data_query(lookup_query)):
-        return False
-    try:
-        limit = int(os.getenv("EVE_SDE_QUERY_LIMIT", "20"))
-        dataset = preferred_static_dataset(lookup_query)
-        rows = await run_eve_db_call(
-            query_static_data,
-            lookup_query,
-            dataset,
-            None,
-            limit,
-        )
-    except Exception:
-        logger.warning("EVE static data lookup failed; continuing with normal RAG query", exc_info=True)
-        return False
-    if not rows:
-        logger.info("EVE static data lookup returned no matching record")
-        return False
-    context = format_static_context(rows)
-    max_chars = int(os.getenv("EVE_SDE_CONTEXT_MAX_CHARS", "30000"))
-    if max_chars > 0 and len(context) > max_chars:
-        context = context[:max_chars].rstrip() + "\n[静态数据结果已截断]"
-    param.user_prompt = (param.user_prompt or "") + (
-        "\n\n【EVE 静态数据 API 结果】\n"
-        f"{context}\n"
-        "回答本次静态数据问题时，以上 MySQL 数据优先于知识库中的冲突信息。"
-        "【最高优先级数据规则】如果 dogma.attributes 中存在 "
-        "attributeID=1544、name=maxGroupFitted 或 "
-        "displayName_zh=该武器组所允许的最大装备数量，value 就是该装备组在一艘舰船上的硬性安装上限；"
-        "必须直接采用这个 value 回答，不能用技能、槽位数量、跃迁干扰强度或模型记忆推算。"
-        "如果 value=1，必须明确回答最多只能安装1个；不能回答2个，也不能说没有限制。"
-        "同一装备的T1、T2、势力版等衍生型号如果属于同一装备组，仍受该装备组上限约束。"
-        "如果数据库字段与模型常识、历史版本记忆或知识库内容冲突，只能以数据库字段为准。"
-        "回答数量限制问题时，先列出字段名、value和结论，再补充其他属性。"
-        "仅在用户询问安装上限时，最终答案必须明确写成：数据库字段：maxGroupFitted=value；"
-        "结论：一艘舰船最多安装value个该装备组模块。"
-        "如果上下文中出现多个同名或不同科技等级的装备，逐个说明；"
-        "若它们的maxGroupFitted相同，可补充说明共享同一装备组安装上限。"
-        "当用户询问“网子/停滞缠绕光束有哪些类型”时，只能按结果中的实际物品逐类列出；"
-        "不得把蓝图、突变质体、炮台或其他记录当成网子模块，也不得凭常识补充数据库没有返回的型号。"
-        "如果结果中没有某个分类，就不要在答案中新增该分类；只按返回清单作答。"
-        "如果存在【SDE 官方舰船清单】，必须按清单的 name_zh 回答舰名，"
-        "禁止以自译、音译或常见译名替代；未返回的属性不得凭记忆补全。"
-        "如果结果包含 dogma.attributes，必须把其中的 attributeID、中文属性名和 value "
-        "按可读方式整理出来；不要只说查到了装备名称。"
-    )
-    return True
 
 
-async def _prepare_skill_routing(
-    rag: Any, request: QueryRequest, param: QueryParam
-) -> tuple[str | None, dict[str, Any]]:
-    from eve_lightrag.eve_names import name_context
-
-    # Supply names alongside the skill data without changing the user's input.
-    glossary = await run_eve_db_call(name_context, request.query)
-    param.user_prompt = (param.user_prompt or "") + glossary
-    result = await _prepare_skill_routing_impl(rag, request, param)
-    glossary = await run_eve_db_call(
-        name_context, request.query + "\n" + (param.user_prompt or "")
-    )
-    param.user_prompt = (param.user_prompt or "") + glossary
-    system_prompt, plan = result
-    return ((system_prompt + glossary) if system_prompt else None), plan
 
 
-async def _prepare_skill_routing_impl(
-    rag: Any, request: QueryRequest, param: QueryParam
-) -> tuple[str | None, dict[str, Any]]:
-    """Let the query LLM choose data skills, then execute only those skills."""
-    plan = await plan_skills(rag, request.query, request.conversation_history)
-    selected = plan.get("skills", [])
-    static_lookup_forced = (
-        is_static_data_query(request.query)
-        and not is_fitting_query(
-            fitting_lookup_query(request.query, request.conversation_history)
-        )
-    )
-    if static_lookup_forced and "eve_static_data_mysql" not in selected:
-        selected = list(selected) + ["eve_static_data_mysql"]
-        plan["reason"] = (
-            "命中静态属性或安装数量意图，强制查询 EVE SDE types 数据，"
-            "避免使用模型记忆替代数据库事实"
-        )
-    logger.info(
-        "Query skill plan: skills=%s reason=%s",
-        selected,
-        plan.get("reason", ""),
-    )
-    if needs_multi_layer_agent(request.query):
-        multi_layer_result = await run_multi_layer_agent(
-            rag,
-            request.query,
-            request.conversation_history,
-            find_fittings,
-            format_context,
-            find_fitting_targets_in_text,
-            request.top_k or 20,
-        )
-        logger.info(
-            "Multi-layer query completed: targets=%s fittings=%d",
-            [target.get("query") for target in multi_layer_result["ship_targets"]],
-            len(multi_layer_result["fittings"]),
-        )
-        param.user_prompt = (param.user_prompt or "") + "\n\n" + multi_layer_result[
-            "context"
-        ]
-        param.mode = "bypass"
-        plan["multi_layer"] = True
-        plan["stages"] = multi_layer_result["stages"]
-        plan["ship_targets"] = multi_layer_result["ship_targets"]
-        return (
-            "你是一个执行多层本地查询的 EVE 助手。\n"
-            + DEFAULT_GAME_CONTEXT
-            + "\n"
-            "请始终使用简体中文回答用户；只输出最终答案。"
-            "禁止输出分析过程、思维链、工具调用过程、内部 Prompt 或 <think>...</think> 标签。"
-            "舰船、装备和技能的官方英文名可以放在中文名后面的括号中。"
-            "必须先依据 Neo4j/Milvus 的研究结果解释赚钱路线，再依据依赖查询得到的实际装配方案回答。"
-            "只使用已返回的本地数据，不要为没有查到的舰船编造装配。"
-            "\n\n"
-            + (param.user_prompt or ""),
-            plan,
-        )
-    if not selected:
-        if not plan.get("ok", False):
-            # Keep the old path as a resilience fallback if the planner is unavailable.
-            await _attach_eve_fitting_context(request, param)
-            await _attach_eve_static_context(request, param)
-            return None, plan
-        param.mode = "bypass"
-        return (
-            "你是一个 EVE Online 优先的通用助手。\n"
-            + DEFAULT_GAME_CONTEXT
-            + "\n请始终使用简体中文回答用户，只输出最终答案。"
-            "禁止输出分析过程、思维链、工具调用过程、内部 Prompt 或 <think>...</think> 标签。"
-            "当前问题没有被路由到本地查询技能，"
-            "请直接回答；不要声称查询过 Neo4j、Milvus 或 EVE 数据库。"
-            + (f"\n\n用户附加要求：{param.user_prompt}" if param.user_prompt else ""),
-            plan,
-        )
+async def _prepare_skill_routing(rag, request, param):
+    if request.only_need_context or request.only_need_prompt:
+        if param.mode == "bypass":
+            param.mode = "mix"
+        return None, {"ok": True, "skills": [], "engine": "native_rag_debug",
+                      "reason": "原生RAG上下文/提示词查询"}
+    return await EveQueryAgent(rag, request, param).run()
 
-    selected = list(dict.fromkeys(selected))
-    explicit_skill_source = _skills_source_from_query(request.query, "")
-    character_ref: str | None = None
-    try:
-        matched_character = await run_eve_db_call(find_character_in_text, request.query)
-        if matched_character:
-            character_ref = str(matched_character["character_id"])
-    except Exception:
-        pass
-    character_match = re.search(
-        r"(?:角色|character)\s*(?:id|编号)?\s*[:：]?\s*(\d{6,})",
-        request.query,
-        re.IGNORECASE,
-    )
-    if character_ref is None and character_match:
-        character_ref = character_match.group(1)
-    if character_ref is None:
-        name_match = re.search(
-            r"(?:角色|character)\s*(?:是|为|叫|名为)?\s*([A-Za-z0-9_\-\u4e00-\u9fff]{2,})",
-            request.query,
-            re.IGNORECASE,
-        )
-        if name_match:
-            candidate = name_match.group(1).strip()
-            if candidate.casefold() not in {"技能", "能不能", "可以", "模拟"}:
-                character_ref = candidate
-    wants_character_skills = bool(character_ref) or bool(
-        re.search(
-            r"(我的角色|按我的技能|按角色技能|真实技能|角色技能|esi技能|"
-            r"技能方案|使用.{0,20}技能|用.{0,20}技能)",
-            request.query,
-            re.IGNORECASE,
-        )
-    )
-    if wants_character_skills and explicit_skill_source not in {"all5", "all0"}:
-        if "eve_character_skills_esi" not in selected:
-            selected.append("eve_character_skills_esi")
-        if "pyfa_fitting_simulator" in selected and "eve_fitting_mysql" not in selected:
-            selected.append("eve_fitting_mysql")
-        plan["skills"] = selected
-        plan["reason"] = (
-            str(plan.get("reason", "") or "")
-            + "；检测到角色名/角色技能意图，强制使用 ESI 角色技能"
-        ).strip("；")
 
-    skill_results: list[dict[str, Any]] = []
-    character_selection_required = False
-    character_result: dict[str, Any] | None = None
-    skill_gap_results: list[dict[str, Any]] = []
-    fitting_recommendation_results: list[dict[str, Any]] = []
-    fitting_variant_results: list[dict[str, Any]] = []
-    db_fitting_simulation_result: dict[str, Any] | None = None
-    if "eve_fitting_mysql" in selected:
-        await _attach_eve_fitting_context(request, param)
-    if "eve_static_data_mysql" in selected:
-        await _attach_eve_static_context(request, param, force=True)
-    if "eve_character_skills_esi" in selected:
-        try:
-            character_result = await run_eve_db_call(
-                get_character_skill_data,
-                character_ref,
-                True,
-                False,
-                False,
-            )
-            skill_results.append(character_result)
-        except Exception as exc:
-            character_selection_required = (
-                character_ref is None and "多个角色" in str(exc)
-            )
-            available_characters = []
-            if character_selection_required:
-                try:
-                    available_characters = await run_eve_db_call(
-                        list_authorized_characters
-                    )
-                except Exception:
-                    available_characters = []
-            skill_results.append(
-                {
-                    "skill": "eve_character_skills_esi",
-                    "error": str(exc),
-                    "note": "未返回 access token 或 refresh token",
-                    "character_selection_required": character_selection_required,
-                    "available_characters": available_characters,
-                }
-            )
-    if (
-        (
-            needs_skill_fitting_recommendation(request.query)
-            or needs_character_fitting_analysis(request.query)
-        )
-        and "eve_character_skills_esi" in selected
-        and "eve_fitting_mysql" in selected
-        and "pyfa_fitting_simulator" in selected
-        and character_result
-        and not contains_eft_fit(request.query)
-    ):
-        try:
-            candidate_fittings = await run_eve_db_call(
-                find_fittings_for_simulation,
-                request.query,
-                request.conversation_history,
-                max(50, request.top_k or 20),
-            )
-            if not candidate_fittings:
-                fitting_recommendation_results = [
-                    {
-                        "skill": "pyfa_fitting_simulator",
-                        "mode": "character_fit_recommendation",
-                        "error": "没有找到该舰船的候选装配方案",
-                    }
-                ]
-            else:
-                character_id = int(character_result["character"]["character_id"])
-                fitting_recommendation_results = await run_eve_db_call(
-                    recommend_fittings_for_character,
-                    candidate_fittings,
-                    character_id,
-                    5,
-                )
-                # Keep the LLM context compact while retaining the complete
-                # fitting data and the computed ranking.
-                recommendation_summaries = [
-                    {
-                        key: value
-                        for key, value in result.items()
-                        if key != "simulation"
-                    }
-                    for result in fitting_recommendation_results
-                ]
-                skill_results.append(
-                    {
-                        "skill": "pyfa_fitting_simulator",
-                        "mode": "character_fit_recommendation",
-                        "character": character_result.get("character"),
-                        "candidate_count": len(candidate_fittings),
-                        "ranked_results": recommendation_summaries,
-                    }
-                )
-                param.user_prompt = (param.user_prompt or "") + (
-                    "\n\n【按角色真实技能筛选的 Pyfa 推荐结果】\n"
-                    + format_context(candidate_fittings)
-                    + "\n\n【Pyfa 逐套模拟排名】\n"
-                    + json.dumps(
-                        recommendation_summaries,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                    + "\n必须优先推荐 skill_ready=true 且 valid=true 的方案；"
-                    "如果没有 skill_ready=true，推荐 missing_sp_total 最少的方案，"
-                    "并列出缺失技能和原因。不得声称没有调用 Pyfa。"
-                )
-                if needs_character_fitting_analysis(request.query):
-                    param.user_prompt += (
-                        "\n本题是数值分析请求。必须直接回答被选装配的 CPU 使用量/总量/剩余量、"
-                        "能量格栅使用量/总量/剩余量、护盾回充或盾修量、电容状态和 DPS/齐射伤害。"
-                        "所有数值必须来自上面的 Pyfa 结果；不要说无法启动 Pyfa，也不要要求用户重新提供装配。"
-                    )
-        except Exception as exc:
-            fitting_recommendation_results = [
-                {
-                    "skill": "pyfa_fitting_simulator",
-                    "mode": "character_fit_recommendation",
-                    "error": str(exc),
-                }
-            ]
-    simulation_result: dict[str, Any] | None = None
-    if (
-        "eve_character_skills_esi" in selected
-        and "eve_fitting_mysql" in selected
-        and character_result
-        and re.search(r"(缺失技能|技能点|技能等级|sp)", request.query, re.IGNORECASE)
-    ):
-        fitting_target = "洛基" if re.search(r"洛基|loki", request.query, re.IGNORECASE) else request.query
-        try:
-            recommended_fittings = await run_eve_db_call(
-                find_fittings, fitting_target, None
-            )
-            character_id = int(character_result["character"]["character_id"])
-            skill_gap_results = await run_eve_db_call(
-                compare_fitting_skill_requirements,
-                recommended_fittings,
-                character_id,
-            )
-        except Exception as exc:
-            skill_gap_results.append(
-                {
-                    "error": str(exc),
-                    "note": "无法批量计算推荐装配的技能缺口",
-                }
-            )
-    if (
-        "pyfa_fitting_simulator" in selected
-        and not skill_gap_results
-        and not fitting_recommendation_results
-        and contains_eft_fit(request.query)
-    ):
-        try:
-            base_payload = await run_eve_db_call(
-                parse_eft_fit,
-                request.query,
-                _skills_source_from_query(request.query, "default"),
-            )
-            if base_payload:
-                if (
-                    "eve_character_skills_esi" in selected
-                    and base_payload.get("skills_source") in {None, "default"}
-                ):
-                    base_payload["skills_source"] = "esi"
-                if (
-                    character_result
-                    and base_payload.get("skills_source") == "esi"
-                    and not base_payload.get("character_id")
-                    and not base_payload.get("character")
-                ):
-                    base_payload["character_id"] = int(
-                        character_result["character"]["character_id"]
-                    )
-                variants = await run_eve_db_call(
-                    build_fit_variants_from_request,
-                    request.query,
-                    base_payload,
-                )
-                fitting_variant_results = await run_eve_db_call(
-                    simulate_fit_variants,
-                    variants,
-                )
-                skill_results.append(
-                    {
-                        "skill": "pyfa_fitting_simulator",
-                        "mode": "eft_variant_simulation",
-                        "variant_count": len(fitting_variant_results),
-                        "results": fitting_variant_results,
-                    }
-                )
-                param.user_prompt = (param.user_prompt or "") + (
-                    "\n\n【Pyfa/Eos EFT 改装方案逐项模拟结果】\n"
-                    + json.dumps(
-                        fitting_variant_results,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                    + "\n以上是按用户贴出的 EFT 和改装要求重新生成变体后实际调用 Pyfa/Eos 得到的结果；"
-                    "必须直接引用这些新结果里的 CPU、能量栅格、DPS、盾修/回盾和电容数值。"
-                    "如果结果中存在 charges.used_by_module 或 charges.used，必须说明实际用于计算 DPS 的弹药；"
-                    "如果存在 charges.available_by_module，必须列出去重后的可用弹药。"
-                    "不要说无法重新模拟，不要只基于旧结果或常识估算。"
-                )
-            else:
-                simulation_result = {
-                    "skill": "pyfa_fitting_simulator",
-                    "valid": False,
-                    "errors": [
-                        {
-                            "type": "eft_parse_failed",
-                            "reason": "检测到 EFT 格式但没有解析出有效装配",
-                        }
-                    ],
-                }
-        except Exception as exc:
-            simulation_result = {
-                "skill": "pyfa_fitting_simulator",
-                "valid": False,
-                "errors": [{"type": "eft_variant_simulation_error", "error": str(exc)}],
-            }
-    if (
-        "pyfa_fitting_simulator" in selected
-        and "eve_fitting_mysql" in selected
-        and not skill_gap_results
-        and not fitting_recommendation_results
-        and not fitting_variant_results
-        and not contains_eft_fit(request.query)
-        and re.search(
-            r"(pyfa|模拟|验证|查看属性|计算属性|丢到|扔到)",
-            request.query,
-            re.IGNORECASE,
-        )
-    ):
-        try:
-            lookup_query = fitting_lookup_query(
-                request.query, request.conversation_history
-            )
-            candidate_fittings = await run_eve_db_call(
-                find_fittings,
-                lookup_query,
-                1,
-            )
-            if not candidate_fittings:
-                candidate_fittings = await run_eve_db_call(
-                    find_fittings_for_simulation,
-                    request.query,
-                    request.conversation_history,
-                    1,
-                )
-            if candidate_fittings:
-                selected_fitting = candidate_fittings[0]
-                simulation_skill_source = _skills_source_from_query(
-                    request.query, "default"
-                )
-                simulation_character_id = None
-                if (
-                    character_result
-                    and simulation_skill_source in {None, "", "default"}
-                ):
-                    simulation_skill_source = "esi"
-                    simulation_character_id = int(
-                        character_result["character"]["character_id"]
-                    )
-                payload = await run_eve_db_call(
-                    fitting_to_simulation_payload,
-                    selected_fitting,
-                    simulation_skill_source,
-                    simulation_character_id,
-                )
-                simulation = await run_eve_db_call(simulate_fitting, payload)
-                db_fitting_simulation_result = {
-                    "skill": "pyfa_fitting_simulator",
-                    "mode": "mysql_fitting_simulation",
-                    "fitting": {
-                        "id": selected_fitting.get("id"),
-                        "fitting_name": selected_fitting.get("fitting_name"),
-                        "ship": selected_fitting.get("ship_name_local")
-                        or selected_fitting.get("ship_name_en"),
-                        "source_file": selected_fitting.get("source_file"),
-                    },
-                    "payload": payload,
-                    "simulation": simulation,
-                }
-                skill_results.append(db_fitting_simulation_result)
-                param.user_prompt = (param.user_prompt or "") + (
-                    "\n\n【从 MySQL 装配库选取并调用 Pyfa/Eos 的模拟结果】\n"
-                    + json.dumps(
-                        db_fitting_simulation_result,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                    + "\n这是后端实际选中的一套数据库装配并调用 Pyfa/Eos 得到的结果；"
-                    "必须基于其中 fitting、resources、damage、tank、ship_stats 和 errors 回答。"
-                    "如果结果中存在 charges.used_by_module 或 charges.used，必须说明实际用于计算 DPS 的弹药；"
-                    "如果存在 charges.available_by_module，必须按武器列过去重后的可用弹药。"
-                    "不要说无法调用 Pyfa，也不要用手算估计值替代这些结果。"
-                )
-            else:
-                db_fitting_simulation_result = {
-                    "skill": "pyfa_fitting_simulator",
-                    "mode": "mysql_fitting_simulation",
-                    "valid": False,
-                    "errors": [
-                        {
-                            "type": "fitting_not_found",
-                            "reason": "没有在 MySQL 装配库中找到可用于 Pyfa 的候选装配",
-                        }
-                    ],
-                }
-                skill_results.append(db_fitting_simulation_result)
-        except Exception as exc:
-            db_fitting_simulation_result = {
-                "skill": "pyfa_fitting_simulator",
-                "mode": "mysql_fitting_simulation",
-                "valid": False,
-                "errors": [{"type": "simulation_error", "error": str(exc)}],
-            }
-            skill_results.append(db_fitting_simulation_result)
-    if (
-        "pyfa_fitting_simulator" in selected
-        and not skill_gap_results
-        and not fitting_recommendation_results
-        and not fitting_variant_results
-        and db_fitting_simulation_result is None
-    ):
-        simulation_request = await extract_simulation_payload(
-            rag, request.query, request.conversation_history
-        )
-        if simulation_request.get("payload"):
-            explicit_skill_source = _skills_source_from_query(request.query, "")
-            if explicit_skill_source:
-                simulation_request["payload"]["skills_source"] = explicit_skill_source
-            if (
-                "eve_character_skills_esi" in selected
-                and simulation_request["payload"].get("skills_source")
-                in {None, "default"}
-            ):
-                simulation_request["payload"]["skills_source"] = "esi"
-            if (
-                character_result
-                and simulation_request["payload"].get("skills_source") == "esi"
-                and not simulation_request["payload"].get("character_id")
-                and not simulation_request["payload"].get("character")
-            ):
-                simulation_request["payload"]["character_id"] = int(
-                    character_result["character"]["character_id"]
-                )
-            if (
-                character_selection_required
-                and simulation_request["payload"].get("skills_source") == "esi"
-                and not simulation_request["payload"].get("character_id")
-                and not simulation_request["payload"].get("character")
-            ):
-                simulation_result = {
-                    "skill": "pyfa_fitting_simulator",
-                    "valid": False,
-                    "errors": [
-                        {
-                            "type": "character_selection_required",
-                            "reason": "已授权多个角色，请先选择 character_id 或角色名",
-                        }
-                    ],
-                }
-            else:
-                try:
-                    simulation_result = await run_eve_db_call(
-                        simulate_fitting, simulation_request["payload"]
-                    )
-                except Exception as exc:
-                    simulation_result = {
-                        "skill": "pyfa_fitting_simulator",
-                        "valid": False,
-                        "errors": [{"type": "simulation_error", "error": str(exc)}],
-                    }
-        else:
-            simulation_result = {
-                "skill": "pyfa_fitting_simulator",
-                "valid": False,
-                "errors": [
-                    {
-                        "type": "payload_missing",
-                        "reason": "没有从用户问题中提取到明确的舰船或装备",
-                    }
-                ],
-            }
+async def _query_with_skill_sources(rag, query, *, param, system_prompt, skill_plan, **kwargs):
+    if skill_plan.get("_direct_response"):
+        return {"status": "success", "data": {}, "llm_response": {
+            "content": skill_plan["_direct_response"], "is_streaming": False,
+            "response_iterator": None, "llm_generated": False}}
+    result = await rag.aquery_llm(query, param=param, system_prompt=system_prompt, **kwargs)
+    source_data = skill_plan.get("_rag_source_data", {})
+    if source_data.get("references") or source_data.get("chunks"):
+        data = result.setdefault("data", {})
+        if not data.get("references"):
+            data.update(source_data)
+    return result
 
-    skill_limit = request.top_k or 20
-    backend_tasks = []
-    if "neo4j_knowledge_graph" in selected:
-        backend_tasks.append(query_neo4j(rag, request.query, skill_limit))
-    if "milvus_vector_search" in selected:
-        backend_tasks.append(query_milvus(rag, request.query, skill_limit))
-    if backend_tasks:
-        backend_results = await asyncio.gather(*backend_tasks, return_exceptions=True)
-        for result in backend_results:
-            if isinstance(result, Exception):
-                logger.warning("Query skill failed: %s", result, exc_info=True)
-                skill_results.append(
-                    {
-                        "skill": "query_skill_error",
-                        "error": str(result),
-                    }
-                )
-            else:
-                skill_results.append(result)
 
-    if skill_results:
-        param.user_prompt = (param.user_prompt or "") + "\n\n" + format_skill_context(
-            skill_results
-        )
-    if simulation_result is not None:
-        param.user_prompt = (param.user_prompt or "") + (
-            "\n\n【Pyfa/Eos 装配模拟结果】\n"
-            + json.dumps(simulation_result, ensure_ascii=False, separators=(",", ":"))
-            + "\n以上模拟结果是计算引擎输出；回答时不要修改其中的数值。"
-        )
-    if skill_gap_results:
-        param.user_prompt = (param.user_prompt or "") + (
-            "\n\n【按角色技能逐套装配计算结果】\n"
-            + json.dumps(skill_gap_results, ensure_ascii=False, separators=(",", ":"))
-            + "\n请逐套装配列出缺失技能、当前等级、所需等级和缺失技能点；"
-            "不要把不同装配的技能缺口合并成一个结论。"
-        )
 
-    # The selected skills have already supplied the context. Bypass LightRAG's
-    # automatic combined retrieval so Neo4j/Milvus are not queried a second time.
-    param.mode = "bypass"
-    static_authority_prompt = ""
-    if "eve_static_data_mysql" in selected and re.search(
-        r"安装数量|数量限制|装备上限|安装上限|最多装|能装几个|安装限制", request.query
-    ):
-        static_authority_prompt = (
-            "\n【静态数据硬性裁决规则】\n"
-            "你正在回答 EVE 静态数据问题。下面 MySQL 数据是唯一权威来源。\n"
-            "请先查找上下文开头的【硬性数据库事实：优先使用】；"
-            "该区块中的装备名、maxGroupFitted、value和结论是本题的直接答案。\n"
-            "若用户问“能装几个、安装数量、装备上限、限制数量”，只能读取 "
-            "dogma.attributes 中的 maxGroupFitted / attributeID=1544 / "
-            "“该武器组所允许的最大装备数量”。该字段 value 就是最终答案。\n"
-            "严禁把 warpScrambleStrength、跃迁抗性、槽位数量、技能等级或你的历史记忆 "
-            "当作安装数量。严禁在数据库已经给出 value 后回答“没有限制”、回答其他数字 "
-            "或补充未经数据库证明的规则。\n"
-            "回答时必须使用以下格式：数据库字段：maxGroupFitted=value；"
-            "结论：一艘舰船最多安装value个该装备组模块。"
-            "如果 value=1，必须明确写“最多安装1个”，不能写2个。\n"
-        )
-    skill_prompt = (
-        "你是一个基于本地查询技能回答问题的 EVE Online 助手。\n"
-        + DEFAULT_GAME_CONTEXT
-        + "\n"
-        "请始终使用简体中文回答用户；只输出最终答案。"
-        "禁止输出分析过程、思维链、工具调用过程、内部 Prompt 或 <think>...</think> 标签。"
-        "请优先依据下面技能返回的结果回答，结果没有提供的内容不要编造。"
-        "如果技能结果之间冲突，请明确指出冲突。"
-        "如果存在【Pyfa/Eos 装配模拟结果】，其中的 valid、资源占用和计算数值优先于模型记忆；"
-        "不要把模拟结果改写成未经计算的估算值。"
-        "如果 Pyfa 结果包含 charges.used_by_module 或 charges.used，必须说明本次 DPS 使用的弹药；"
-        "如果包含 charges.available_by_module，必须列出去重后的可用弹药，不要编造额外弹药。"
-        + static_authority_prompt
-        + "\n\n"
-        + (param.user_prompt or "")
-    )
-    return skill_prompt, plan
+
+
+
+
+
+def _cited_source_footer(text: str, references: list[dict[str, Any]]) -> str:
+    """Render verified citation filenames for clients that ignore reference events."""
+    cited = set(re.findall(r"\[(?:reference_id\s*:\s*)?(\d+)\]", text or ""))
+    lines = []
+    seen = set()
+    for ref in references:
+        ref_id = str(ref.get("reference_id", ""))
+        path = str(ref.get("file_path") or "")
+        name = path.replace("\\", "/").rsplit("/", 1)[-1]
+        name = " ".join(name.split()).replace("`", "'")
+        if ref_id not in cited or not name or ref_id in seen:
+            continue
+        seen.add(ref_id)
+        if name not in text:
+            lines.append(f"- [{ref_id}] `{name}`")
+    return "\n\n参考来源：\n" + "\n".join(lines) if lines else ""
 
 
 def _public_skill_plan(plan: dict[str, Any]) -> dict[str, Any]:
@@ -1112,23 +451,17 @@ def _public_skill_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "ok": bool(plan.get("ok", False)),
         "skills": list(plan.get("skills", []) or []),
         "reason": str(plan.get("reason", "") or ""),
+        "engine": plan.get("engine", "langgraph"),
+        "stages": list(plan.get("stages", [])),
+        "skills_source": plan.get("skills_source"),
+        "revision_count": int(plan.get("revision_count", 0)),
+        "fitting_ids": list(plan.get("fitting_ids", [])),
+        "simulation_count": int(plan.get("simulation_count", 0)),
+        "ready_count": int(plan.get("ready_count", 0)),
+        "stop_reason": str(plan.get("stop_reason", "")),
     }
 
 
-def _skills_source_from_query(query: str, default: str = "default") -> str:
-    if re.search(
-        r"(全\s*v|全\s*5|全五|满技能|滿技能|all\s*(?:level\s*)?5|all5)",
-        query or "",
-        re.IGNORECASE,
-    ):
-        return "all5"
-    if re.search(
-        r"(全\s*0|全零|all\s*(?:level\s*)?0|all0)",
-        query or "",
-        re.IGNORECASE,
-    ):
-        return "all0"
-    return default
 
 
 def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
@@ -1248,16 +581,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             configured = 2
         return max(0, min(configured, 5))
 
-    def _skills_source_from_query(query: str, default: str = "default") -> str:
-        if re.search(
-            r"(全\s*v|全\s*5|全五|满技能|滿技能|all\s*(?:level\s*)?5|all5)",
-            query or "",
-            re.IGNORECASE,
-        ):
-            return "all5"
-        if re.search(r"(全\s*0|全零|all\s*(?:level\s*)?0|all0)", query or "", re.IGNORECASE):
-            return "all0"
-        return default
 
     def _cleanup_query_jobs() -> None:
         try:
@@ -1826,15 +1149,17 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             )  # Ensure stream=False for non-streaming endpoint
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
+            start_time = time.perf_counter()
             skill_system_prompt, skill_plan = await _prepare_skill_routing(
                 rag, request, param
             )
             # Unified approach: always use aquery_llm for both cases
-            start_time = time.perf_counter()
-            result = await rag.aquery_llm(
+            result = await _query_with_skill_sources(
+                rag,
                 request.query,
                 param=param,
                 system_prompt=skill_system_prompt,
+                skill_plan=skill_plan,
             )
             response_time = round(time.perf_counter() - start_time, 3)
 
@@ -1845,9 +1170,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             # Get the non-streaming response content
             response_content = llm_response.get("content", "")
-            response_content = _strip_internal_reasoning(response_content)
-            from eve_lightrag.eve_names import localize_text
-            response_content = await run_eve_db_call(localize_text, response_content)
+            if not (request.only_need_context or request.only_need_prompt) and llm_response.get("llm_generated", True):
+                response_content = _strip_internal_reasoning(response_content)
+                from eve_lightrag.eve_names import localize_text
+                response_content = await run_eve_db_call(localize_text, response_content)
             # Whether the answering LLM wrote it. A missing flag means a result
             # shape that predates it, which only the LLM paths produce.
             llm_generated = bool(llm_response.get("llm_generated", True))
@@ -1855,6 +1181,9 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 response_content = "No relevant context found for the query."
                 # Substituted placeholder: nothing was generated.
                 llm_generated = False
+
+            if request.include_references and llm_generated:
+                response_content += _cited_source_footer(response_content, references)
 
             # Enrich references with chunk content if requested
             if request.include_references and request.include_chunk_content:
@@ -2013,26 +1342,37 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     try:
                         from eve_lightrag.eve_names import NameStream
                         name_stream = NameStream()
+                        rendered_parts = []
                         async for chunk in response_stream:
                             if chunk:
                                 translated = name_stream.feed(chunk)
                                 if translated:
+                                    rendered_parts.append(translated)
                                     yield f"{json.dumps({'response': translated})}\n"
                         translated = name_stream.feed(final=True)
                         if translated:
+                            rendered_parts.append(translated)
                             yield f"{json.dumps({'response': translated})}\n"
+                        if include_references:
+                            footer = _cited_source_footer("".join(rendered_parts), references)
+                            if footer:
+                                yield f"{json.dumps({'response': footer})}\n"
                     except Exception as e:
                         logger.error(f"Streaming error: {str(e)}")
                         yield f"{json.dumps({'error': str(e)})}\n"
             else:
                 # Non-streaming: complete response in one message
                 response_content = llm_response.get("content", "")
-                from eve_lightrag.eve_names import localize_text
-                response_content = await run_eve_db_call(localize_text, response_content)
+                if llm_response.get("llm_generated", True):
+                    from eve_lightrag.eve_names import localize_text
+                    response_content = await run_eve_db_call(localize_text, response_content)
                 llm_generated = bool(llm_response.get("llm_generated", True))
                 if not response_content:
                     response_content = "No relevant context found for the query."
                     llm_generated = False
+
+                if include_references and llm_generated:
+                    response_content += _cited_source_footer(response_content, references)
 
                 # The flag rides this line rather than a separate one: it
                 # describes THIS content, and a client that ignores the key
@@ -2311,13 +1651,12 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
             param = request.to_query_params(stream_mode)
+            start_time = time.perf_counter()
             skill_system_prompt, skill_plan = await _prepare_skill_routing(
                 rag, request, param
             )
 
             from fastapi.responses import StreamingResponse
-
-            start_time = time.perf_counter()
 
             # When the client opts in via include_progress, run aquery_llm as a
             # background task so progress events can be interleaved into the
@@ -2345,10 +1684,12 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     # item. put_nowait never blocks on the unbounded queue, which
                     # keeps the finally safe even while a CancelledError propagates.
                     try:
-                        return await rag.aquery_llm(
+                        return await _query_with_skill_sources(
+                            rag,
                             request.query,
                             param=param,
                             system_prompt=skill_system_prompt,
+                            skill_plan=skill_plan,
                             progress_callback=progress_callback,
                         )
                     finally:
@@ -2415,10 +1756,12 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 )
             else:
                 # Default path: no progress events, original protocol order preserved.
-                result = await rag.aquery_llm(
+                result = await _query_with_skill_sources(
+                    rag,
                     request.query,
                     param=param,
                     system_prompt=skill_system_prompt,
+                    skill_plan=skill_plan,
                 )
                 stream_gen = _build_stream_generator(
                     result=result,

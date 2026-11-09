@@ -35,6 +35,11 @@ DEFAULT_GAME_CONTEXT = (
     "例如“毒蜥”默认指 EVE Online 的毒蜥级（Gila），"
     "“配置”默认指舰船装配（fit/loadout），不是电脑硬件配置。"
     "只有用户明确提到其他游戏时，才切换到其他游戏语境。"
+    "EVE术语可能是舰船简称、物品名或玩家黑话，不能只按字面含义扩写。"
+    "涉及游戏机制、数值、操作步骤、舰船定位的事实必须有本次查询结果支持；"
+    "检索命中不等于支持结论，不能把仅有关键词关联的段落当作定义。"
+    "存在歧义时先说明资料中能确认的含义，再询问用户语境。"
+    "资料未覆盖的机制应明确说无法确认，不得编造税费、技能、装备或操作。"
 )
 
 _EXECUTORS: dict[str, ThreadPoolExecutor] = {}
@@ -81,86 +86,10 @@ async def run_eve_db_call(func: Any, *args: Any, **kwargs: Any) -> Any:
         return await loop.run_in_executor(executor, call)
 
 
-def needs_multi_layer_agent(query: str) -> bool:
-    """Return whether the query needs research first and fitting lookup second."""
-    normalized = " ".join((query or "").casefold().split())
-    has_income = bool(
-        re.search(
-            r"(isk|赚钱|赚取|收益|收入|刷钱|挣钱|致富|怎么赚|如何赚)",
-            normalized,
-            re.IGNORECASE,
-        )
-    )
-    has_ship_or_fitting = bool(
-        re.search(
-            r"(什么船|哪条船|哪些船|用船|舰船|飞船|配装|装配|配船|怎么配|如何配|fit(?:ting)?|loadout)",
-            normalized,
-            re.IGNORECASE,
-        )
-    )
-    return has_income and has_ship_or_fitting
 
 
-def needs_skill_fitting_recommendation(query: str) -> bool:
-    """Return whether the user wants a fit selected against real character skills."""
-    normalized = " ".join((query or "").casefold().split())
-    has_character_context = bool(
-        re.search(
-            r"(我的技能|我现在的技能|按我的技能|按角色技能|真实技能|"
-            r"角色技能|esi技能|适合我|适配我|技能适配|技能匹配|"
-            r"当前技能|现有技能|技能情况|技能底子|"
-            r"角色\s*(?:id|编号|名|名字))",
-            normalized,
-            re.IGNORECASE,
-        )
-    )
-    has_recommendation_intent = bool(
-        re.search(
-            r"(推荐|建议|定制|适合|合适|匹配|选择|挑一套|哪一套|"
-            r"最适合|能用的|可用的).{0,20}"
-            r"(配置|装配|配装|配船|fit|loadout|舰船)",
-            normalized,
-            re.IGNORECASE,
-        )
-        or re.search(
-            r"(配置|装配|配装|配船|fit|loadout|舰船).{0,20}"
-            r"(推荐|建议|定制|适合|合适|匹配|哪一套|能用)",
-            normalized,
-            re.IGNORECASE,
-        )
-    )
-    return has_character_context and has_recommendation_intent
 
 
-def needs_character_fitting_analysis(query: str) -> bool:
-    """Return whether real character skills must be used to calculate fit metrics."""
-    normalized = " ".join((query or "").casefold().split())
-    has_character_context = bool(
-        re.search(
-            r"(我的技能|我现在的技能|按我的技能|按角色技能|真实技能|角色技能|"
-            r"esi技能|当前技能|现有技能|技能情况|"
-            r"角色\s*(?:id|编号|名|名字))",
-            normalized,
-            re.IGNORECASE,
-        )
-    )
-    has_metric = bool(
-        re.search(
-            r"(cpu|pg|电网|能量格栅|能量栅格|回盾|护盾回充|盾修|"
-            r"电容|cap|dps|伤害|输出|ehp|有效生命|槽位)",
-            normalized,
-            re.IGNORECASE,
-        )
-    )
-    has_fit_reference = bool(
-        re.search(
-            r"(装配|配装|配船|配置|方案|这套|pve|刷怪|速刷|"
-            r"盾导弹|导弹流|舰船|fit|loadout|pyfa)",
-            normalized,
-            re.IGNORECASE,
-        )
-    )
-    return has_character_context and has_metric and has_fit_reference
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -181,152 +110,6 @@ def _parse_json_object(text: str) -> dict[str, Any]:
             return {}
 
 
-async def plan_skills(
-    rag: Any,
-    query: str,
-    conversation_history: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Ask the configured query LLM which data skills are needed."""
-    system_prompt = (
-        "你是 LightRAG 的查询技能路由器。你只能从给定技能中选择需要调用的技能，"
-        "不要回答用户问题，不要输出分析过程。必须只输出 JSON，不要 Markdown。\n"
-        + DEFAULT_GAME_CONTEXT
-        + "\n"
-        "技能说明：\n"
-        + "\n".join(f"- {name}: {desc}" for name, desc in SKILL_DESCRIPTIONS.items())
-        + "\n规则：\n"
-        "1. 纯闲聊、创作、翻译或不需要本地资料的问题，skills 返回空数组 []。\n"
-        "2. 需要知识库实体关系、上下位关系、关联关系时选择 neo4j_knowledge_graph。\n"
-        "3. 需要从本地文档按语义查找原文、说明、段落或证据时选择 milvus_vector_search。\n"
-        "4. EVE 舰船装配只选择 eve_fitting_mysql，不要选择 eve_static_data_mysql。\n"
-        "5. EVE 装备、舰船、蓝图、星系、物品属性和 SDE 信息选择 eve_static_data_mysql。\n"
-        "6. 用户明确要求模拟、验证装配，或询问 CPU/能量栅格/槽位是否够、DPS、EHP、抗性、电容时选择 pyfa_fitting_simulator；"
-        "这类问题通常还需要 eve_static_data_mysql。\n"
-        "7. 用户询问我的角色技能、我的角色能否使用/装配、按真实角色技能计算，选择 eve_character_skills_esi；"
-        "仅“全五模拟/全零模拟/指定技能等级模拟”不需要 ESI。\n"
-        "8. 一个问题可以同时选择多个技能，按照实际依赖选择，不要为了凑数量调用技能。\n"
-        "9. 用户使用中文时，reason 必须用中文填写。\n"
-        '输出格式：{"skills":["技能名"],"reason":"简短中文原因"}'
-    )
-    from eve_lightrag.eve_names import name_context
-    prompt = f"用户问题：\n{query.strip()}" + await run_eve_db_call(name_context, query)
-    global_config = rag._build_global_config()
-    llm = global_config["role_llm_funcs"]["query"]
-    try:
-        raw = await llm(
-            prompt,
-            system_prompt=system_prompt,
-            history_messages=conversation_history or [],
-            enable_cot=False,
-            stream=False,
-        )
-        parsed = _parse_json_object(raw if isinstance(raw, str) else str(raw))
-        selected = parsed.get("skills", [])
-        if not isinstance(selected, list):
-            selected = []
-        selected = [skill for skill in selected if skill in SKILL_NAMES]
-        normalized_query = query.casefold()
-        # ISK-making and beginner gameplay questions need both the structured
-        # relationship context and the source-document explanations.
-        if (
-            re.search(r"isk", normalized_query)
-            and re.search(r"(新人|新手|赚钱|赚取|收益|收入|刷钱|挣钱)", normalized_query)
-        ):
-            selected = ["neo4j_knowledge_graph", "milvus_vector_search"]
-            parsed["reason"] = (
-                "新人ISK收益问题同时需要知识图谱中的玩法关联和文档中的具体指南"
-            )
-        if needs_multi_layer_agent(query):
-            selected = [
-                "neo4j_knowledge_graph",
-                "milvus_vector_search",
-                "eve_fitting_mysql",
-            ]
-            parsed["reason"] = (
-                "这是赚钱路线、推荐舰船和舰船装配的复合问题，需要分层查询"
-            )
-        if needs_skill_fitting_recommendation(query):
-            selected = [
-                "eve_character_skills_esi",
-                "eve_fitting_mysql",
-                "pyfa_fitting_simulator",
-            ]
-            parsed["reason"] = (
-                "用户要求按已授权角色的真实技能，从装配库候选方案中调用 Pyfa "
-                "逐套验证并推荐可用配置"
-            )
-        if needs_character_fitting_analysis(query):
-            selected = [
-                "eve_character_skills_esi",
-                "eve_fitting_mysql",
-                "pyfa_fitting_simulator",
-            ]
-            parsed["reason"] = (
-                "用户要求按角色真实技能对装配进行 Pyfa 计算，返回 CPU、"
-                "能量格栅、护盾回充、电容和 DPS 等指标"
-            )
-        if re.search(
-            r"(pyfa|模拟|验证|查看属性|计算属性|丢到|扔到).{0,20}"
-            r"(装配|配置|配装|fit|舰船|洛基|金鹏|tengu|loki)"
-            r"|"
-            r"(装配|配置|配装|fit|舰船|洛基|金鹏|tengu|loki).{0,20}"
-            r"(pyfa|模拟|验证|查看属性|计算属性|丢到|扔到)",
-            normalized_query,
-            re.IGNORECASE,
-        ):
-            if "eve_fitting_mysql" not in selected:
-                selected.append("eve_fitting_mysql")
-            if "pyfa_fitting_simulator" not in selected:
-                selected.append("pyfa_fitting_simulator")
-            parsed["reason"] = (
-                "用户要求从装配库选择装配并调用 Pyfa 计算属性"
-            )
-        if re.search(
-            r"(网子|停滞缠绕|停滞缠绕光束|stasis\s+webifier)",
-            normalized_query,
-            re.IGNORECASE,
-        ) and re.search(
-            r"(类型|型号|分类|变体|有哪些)",
-            normalized_query,
-            re.IGNORECASE,
-        ):
-            selected = ["eve_static_data_mysql"]
-            parsed["reason"] = (
-                "这是停滞缠绕光束类型目录查询，只读取 EVE SDE 静态数据中的实际模块"
-            )
-        if re.search(
-            r"(我的角色|按我的技能|按角色技能|真实技能|角色技能|esi技能|技能方案|"
-            r"(?:使用|用).{0,20}(?:技能|技能方案)|"
-            r"角色\s*(?:id|编号|名|名字)|"
-            r"(?:读取|查询).{0,20}(?:用户|角色).{0,10}技能)",
-            normalized_query,
-            re.IGNORECASE,
-        ):
-            if "eve_character_skills_esi" not in selected:
-                selected.append("eve_character_skills_esi")
-            if re.search(
-                r"(能不能|是否能|可以装|装得上|模拟|验证|cpu|能量栅格|"
-                r"dps|ehp|抗性|电容|缺失技能|技能点|技能等级|sp)",
-                normalized_query,
-                re.IGNORECASE,
-            ) and "pyfa_fitting_simulator" not in selected:
-                selected.append("pyfa_fitting_simulator")
-            parsed["reason"] = (
-                "用户要求读取或使用角色真实技能，必须调用 ESI 角色技能 skill"
-            )
-        return {
-            "ok": True,
-            "skills": list(dict.fromkeys(selected)),
-            "reason": str(parsed.get("reason", "")).strip(),
-            "raw": raw if isinstance(raw, str) else str(raw),
-        }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "skills": [],
-            "reason": f"skill planner failed: {exc}",
-            "raw": "",
-        }
 
 
 async def extract_fitting_targets(
@@ -401,7 +184,7 @@ async def extract_simulation_payload(
     conversation_history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Extract an explicit ship/module payload for the Pyfa simulator."""
-    from eve_lightrag.eve_names import name_context
+    from .eve_names import name_context
     glossary = await run_eve_db_call(name_context, query)
     system_prompt = (
         "你是 EVE 装配模拟请求解析器。"
@@ -455,108 +238,6 @@ async def extract_simulation_payload(
         return {"ok": False, "payload": {}, "reason": str(exc), "raw": ""}
 
 
-async def run_multi_layer_agent(
-    rag: Any,
-    query: str,
-    conversation_history: list[dict[str, Any]] | None,
-    fitting_lookup: Any,
-    fitting_formatter: Any,
-    fitting_target_discoverer: Any | None = None,
-    limit: int = 20,
-) -> dict[str, Any]:
-    """Run research first, then dependent ship-fitting lookups."""
-    research_tasks = [
-        query_neo4j(rag, query, limit),
-        query_milvus(rag, query, limit),
-    ]
-    raw_research = await asyncio.gather(
-        *research_tasks, return_exceptions=True
-    )
-    research_results: list[dict[str, Any]] = []
-    for result in raw_research:
-        if isinstance(result, Exception):
-            research_results.append(
-                {"skill": "query_skill_error", "error": str(result)}
-            )
-        else:
-            research_results.append(result)
-
-    target_plan = await extract_fitting_targets(
-        rag,
-        query,
-        research_results,
-        conversation_history,
-    )
-    if not target_plan.get("targets") and fitting_target_discoverer is not None:
-        research_text = format_skill_context(research_results)
-        try:
-            fallback_targets = await run_eve_db_call(
-                fitting_target_discoverer,
-                query + "\n" + research_text,
-                6,
-            )
-        except Exception as exc:
-            fallback_targets = []
-            target_plan["fallback_error"] = str(exc)
-        if fallback_targets:
-            target_plan["targets"] = fallback_targets
-            target_plan["fallback"] = True
-    fitting_rows: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    targets = target_plan.get("targets", [])
-
-    async def _lookup_target(
-        target: dict[str, Any],
-    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        try:
-            rows = await run_eve_db_call(
-                fitting_lookup,
-                target["query"],
-                None,
-            )
-        except Exception as exc:
-            rows = []
-            target["error"] = str(exc)
-        return target, rows or []
-
-    lookup_results = await asyncio.gather(
-        *[_lookup_target(target) for target in targets],
-        return_exceptions=True,
-    )
-    for result in lookup_results:
-        if isinstance(result, Exception):
-            continue
-        _target, rows = result
-        for row in rows or []:
-            row_id = str(row.get("id", ""))
-            if row_id and row_id in seen_ids:
-                continue
-            if row_id:
-                seen_ids.add(row_id)
-            fitting_rows.append(row)
-
-    return {
-        "skill": "eve_income_fitting_multi_layer",
-        "query": query,
-        "stages": [
-            "research_neo4j_and_milvus",
-            "extract_ship_targets",
-            "query_mysql_fittings",
-        ],
-        "research": research_results,
-        "ship_targets": target_plan.get("targets", []),
-        "fittings": fitting_rows,
-        "fitting_context": fitting_formatter(fitting_rows) if fitting_rows else "",
-        "context": (
-            format_skill_context(research_results)
-            + (
-                "\n\n【依赖查询：舰船装配 MySQL 结果】\n"
-                + fitting_formatter(fitting_rows)
-                if fitting_rows
-                else "\n\n【依赖查询：舰船装配 MySQL 结果】\n没有找到候选舰船的装配方案。"
-            )
-        ),
-    }
 
 
 async def query_neo4j(
@@ -626,6 +307,8 @@ async def query_milvus(
         "query": query,
         "results": rows[: max(1, min(limit, 100))],
     }
+
+
 
 
 def format_skill_context(results: list[dict[str, Any]]) -> str:

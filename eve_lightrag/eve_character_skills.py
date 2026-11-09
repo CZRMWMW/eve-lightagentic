@@ -6,7 +6,8 @@ from typing import Any
 
 
 def _services() -> tuple[Any, Any, Any]:
-    from eve_lightrag import eve_esi_bindings
+    from . import eve_esi_bindings
+
     return eve_esi_bindings, eve_esi_bindings, eve_esi_bindings
 
 
@@ -74,7 +75,7 @@ def find_character_in_text(text: str) -> dict[str, Any] | None:
 def _skill_name_map() -> dict[int, str]:
     """Use the local Pyfa SDE for stable English skill names."""
     try:
-        from eve_lightrag.pyfa_skill import _ensure_eos
+        from .pyfa_skill import _ensure_eos
 
         _ensure_eos()
         from eos.saveddata.character import Character
